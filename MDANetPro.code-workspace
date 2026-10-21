@@ -1,0 +1,12 @@
+{
+  "folders": [
+    {
+      "name": "MDANetPro",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": "python",
+    "python.terminal.activateEnvironment": false
+  }
+}
