@@ -18,3 +18,9 @@ mda_client_local.db
 *.db-shm
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Runtime / experiment data (created on first run)
+experiment_data*/
+experiment_manifest*/
+*.mdar
+.fuse_hidden*
