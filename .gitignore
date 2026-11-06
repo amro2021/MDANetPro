@@ -12,3 +12,15 @@ mdaclient_state.json
 # Local encrypted client storage
 mda_client_local.db
 .mda_local_key.bin
+
+# SQLite side files (WAL/SHM hold uncheckpointed data, including private keys)
+*.db-wal
+*.db-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Runtime / experiment data (created on first run)
+experiment_data*/
+experiment_manifest*/
+*.mdar
+.fuse_hidden*

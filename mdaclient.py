@@ -622,6 +622,29 @@ class MDAClientGUI:
         for host, port in list(target_peers - current_peers):
             self.node.add_peer(f"{host}:{port}")
 
+    def _put_node_entry(self, nodes, name, entry):
+        """Insert/update a node in a network node map without clobbering a different node.
+
+        Node maps are keyed by nickname, and nicknames are not unique (every client
+        defaults to "node"). Match by endpoint first; if the name is already used by a
+        different endpoint, store under a suffixed key instead of overwriting it.
+        """
+        endpoint = entry.get("endpoint", "")
+        for node_key, node_entry in nodes.items():
+            if endpoint and self._extract_node_endpoint(node_entry) == endpoint:
+                if isinstance(node_entry, dict):
+                    node_entry.update(entry)
+                else:
+                    nodes[node_key] = dict(entry)
+                return node_key
+        base = str(name).strip() or endpoint or "node"
+        key, suffix = base, 2
+        while key in nodes:
+            key = f"{base}-{suffix}"
+            suffix += 1
+        nodes[key] = dict(entry)
+        return key
+
     def _upsert_local_node_in_networks(self):
         local_endpoint = self._local_endpoint()
         local_name = self.node_name_var.get().strip() or "self"
@@ -644,12 +667,12 @@ class MDAClientGUI:
                 nodes[node_key] = node_entry
                 updated = True
             if not updated:
-                nodes[local_name] = {
+                self._put_node_entry(nodes, local_name, {
                     "endpoint": local_endpoint,
                     "nickname": local_name,
                     "role": network_info.get("my_role", "member"),
                     "pubkey": local_pubkey,
-                }
+                })
             network_info["nodes"] = nodes
 
     def _drain_messages(self):
@@ -1805,12 +1828,12 @@ class MDAClientGUI:
         if requested_role in ("trusted", "seed") and my_role != "seed":
             requested_role = "member"
         requester_pubkey = str(packet.get("public_key", "")).strip()
-        nodes[requester_name] = {
+        self._put_node_entry(nodes, requester_name, {
             "endpoint": sender_endpoint,
             "role": requested_role,
             "nickname": requester_name,
             "pubkey": requester_pubkey,
-        }
+        })
         network_info["nodes"] = nodes
         self.networks[network_name] = network_info
         self._upsert_contact(endpoint=sender_endpoint, nickname=requester_name, network=network_name)
@@ -1977,6 +2000,9 @@ class MDAClientGUI:
         payload_nodes_raw = payload.get("nodes", {})
         if not isinstance(payload_nodes_raw, dict):
             payload_nodes_raw = {}
+        # Work on a copy so adding our own entry can never alter the .mdar's node list.
+        payload_nodes_raw = {key: (dict(value) if isinstance(value, dict) else value) for key, value in payload_nodes_raw.items()}
+        join_targets = self._collect_join_targets(payload_nodes_raw)
         inferred_role = self._infer_my_role_from_nodes(payload_nodes_raw)
         rules_text = ", ".join([str(item).strip() for item in payload_rules if str(item).strip()])
         values = self._show_form_dialog(
@@ -2024,18 +2050,17 @@ class MDAClientGUI:
         local_endpoint = self._local_endpoint()
         nodes_map = network_entry.get("nodes", {})
         if isinstance(nodes_map, dict):
-            nodes_map[local_name] = {
+            self._put_node_entry(nodes_map, local_name, {
                 "endpoint": local_endpoint,
                 "role": my_role,
                 "nickname": local_name,
                 "pubkey": self.identity.get("public_key_pem", ""),
-            }
+            })
             network_entry["nodes"] = nodes_map
         self.networks[name] = network_entry
 
         self.active_network_var.set(name)
         self._log(f"Loaded join profile for network: {name}")
-        join_targets = self._collect_join_targets(payload.get("nodes", {}))
         if join_targets:
             self._log(f"Join targets for '{name}': {', '.join(join_targets)}")
         else:
