@@ -102,8 +102,11 @@ class mda:
         private_key_pem=None,
         public_key_pem=None,
         onion_body_size=None,
+        bind_host=None,
     ):
         self.host = host or self.get_local_ip()
+        # Listen on every adapter by default; self.host is only the address we advertise.
+        self.bind_host = "0.0.0.0" if bind_host is None else bind_host
         self.port = int(port or self.PORT)
         self.peers = []
         self.node_name = node_name or f"node-{self.port}"
@@ -117,6 +120,8 @@ class mda:
         self._circuits = {}
         self._sender_counter = 0
         self._seen_message_nonces = {}
+        # Optional callable returning a list of network summaries for "hello" lookups.
+        self.hello_provider = None
         if onion_body_size is None:
             onion_body_size = self.ONION_BODY_SIZE
         self.onion_body_size = max(128, int(onion_body_size))
@@ -125,12 +130,24 @@ class mda:
 
     @staticmethod
     def get_local_ip():
+        try:
+            from mda_netutils import best_local_ip
+            return best_local_ip()
+        except Exception:
+            pass
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             try:
                 sock.connect(("8.8.8.8", 80))
                 return sock.getsockname()[0]
             except OSError:
                 return "127.0.0.1"
+
+    def set_advertised_host(self, host):
+        """Change the address other nodes should use for us. Returns the old endpoint."""
+        old_endpoint = self.nodeid
+        self.host = str(host)
+        self.nodeid = f"{self.host}:{self.port}"
+        return old_endpoint
 
     @staticmethod
     def get_free_port():
@@ -174,17 +191,27 @@ class mda:
             return self
 
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR would let a second copy of the app silently share the port.
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind((self.bind_host, self.port))
+        except OSError:
+            self.server_socket.close()
+            self.server_socket = None
+            raise
         self.server_socket.listen(32)
         self.server_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.server_thread.start()
         return self
 
     def _accept_loop(self):
-        while True:
+        server_socket = self.server_socket  # close() sets the attribute to None
+        while server_socket is not None:
             try:
-                conn, addr = self.server_socket.accept()
+                conn, addr = server_socket.accept()
             except OSError:
                 break
             thread = threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True)
@@ -225,7 +252,20 @@ class mda:
             packet.setdefault("received_from", f"{addr[0]}:{addr[1]}")
             print(f"[{self.nodeid}] received: {packet}", flush=True)
             if packet.get("type") == "ping":
-                reply = {"type": "pong", "nodeid": self.nodeid}
+                reply = {"type": "pong", "nodeid": self.nodeid, "seen_ip": addr[0]}
+                conn.sendall(mdaconnection.encode_packet(reply))
+                return
+            if packet.get("type") == "reach_probe":
+                conn.sendall(mdaconnection.encode_packet(self._answer_reach_probe(packet, addr)))
+                return
+            if packet.get("type") == "hello":
+                networks = []
+                if callable(self.hello_provider):
+                    try:
+                        networks = list(self.hello_provider() or [])
+                    except Exception:
+                        networks = []
+                reply = {"type": "hello_reply", "nodeid": self.nodeid, "seen_ip": addr[0], "networks": networks}
                 conn.sendall(mdaconnection.encode_packet(reply))
                 return
             if packet.get("routing") == "onion" and packet.get("type") in (self.MESSAGE_REAL, self.MESSAGE_FAKE):
@@ -398,6 +438,56 @@ class mda:
         payload = {"type": "ping", "nodeid": self.nodeid, "time": time.time()}
         ack = self.send_message(host, port, payload, timeout=timeout)
         return ack
+
+    def _answer_reach_probe(self, packet, addr):
+        """Connect back to the asking node (at the IP we saw it from) to test the reverse path."""
+        result = {"type": "reach_result", "nodeid": self.nodeid, "seen_ip": addr[0], "callback_ok": False, "callback_error": ""}
+        try:
+            callback_port = int(packet.get("callback_port", 0))
+        except (TypeError, ValueError):
+            callback_port = 0
+        if not 0 < callback_port < 65536:
+            result["callback_error"] = "missing callback port"
+            return result
+        try:
+            reply = self.ping_peer(addr[0], callback_port, timeout=4)
+            result["callback_ok"] = isinstance(reply, dict) and reply.get("type") == "pong"
+            if not result["callback_ok"]:
+                result["callback_error"] = "no reply"
+        except (OSError, ValueError) as exc:
+            result["callback_error"] = str(exc) or exc.__class__.__name__
+        return result
+
+    def probe_reachability(self, endpoint, timeout=8):
+        """Test both directions with one peer.
+
+        Returns {"connect_ok", "callback_ok", "seen_ip", "error"}:
+        connect_ok  - we could open a connection to the peer
+        callback_ok - the peer could open a connection back to us
+        seen_ip     - the address the peer saw us coming from
+        """
+        result = {"connect_ok": False, "callback_ok": False, "seen_ip": "", "error": ""}
+        try:
+            host, port = self.normalize_peer(endpoint)
+            reply = self.send_message(host, port, {"type": "reach_probe", "callback_port": self.port, "nodeid": self.nodeid}, timeout=timeout)
+        except (OSError, ValueError) as exc:
+            result["error"] = str(exc) or exc.__class__.__name__
+            return result
+        result["connect_ok"] = True
+        if isinstance(reply, dict):
+            result["seen_ip"] = str(reply.get("seen_ip", ""))
+            if reply.get("type") == "reach_result":
+                result["callback_ok"] = bool(reply.get("callback_ok"))
+                result["error"] = str(reply.get("callback_error", ""))
+            else:
+                result["error"] = "peer runs an older version (cannot test the reverse direction)"
+        return result
+
+    def hello(self, endpoint, timeout=5):
+        """Ask a node which networks it offers. Returns the hello_reply dict or None."""
+        host, port = self.normalize_peer(endpoint)
+        reply = self.send_message(host, port, {"type": "hello", "nodeid": self.nodeid}, timeout=timeout)
+        return reply if isinstance(reply, dict) and reply.get("type") == "hello_reply" else None
 
     def send_message(self, host, port, payload, timeout=5):
         with socket.create_connection((host, port), timeout=timeout) as conn:
@@ -599,6 +689,11 @@ class mda:
 
     def close(self):
         if self.server_socket is not None:
+            try:
+                # Wake the thread blocked in accept(); close() alone does not on Linux.
+                self.server_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self.server_socket.close()
             except OSError:
