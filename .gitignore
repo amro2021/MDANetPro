@@ -24,3 +24,9 @@ experiment_data*/
 experiment_manifest*/
 *.mdar
 .fuse_hidden*
+
+# PyInstaller output (published as GitHub Release assets instead)
+build/
+dist/
+release-exe/*.exe
+*.zip
