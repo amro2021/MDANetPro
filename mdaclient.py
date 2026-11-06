@@ -6,8 +6,10 @@ import json
 import os
 import queue
 import random
+import socket
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 import uuid
@@ -18,9 +20,45 @@ from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pss
 
+import mda_firewall
 from client_storage import ClientStorage
+from mda_discovery import DISCOVERY_PORT, LanDiscovery
+from mda_netutils import best_local_ip, candidate_ips, local_ip_for
 from mdanetwork import mda
 from net_profile import export_mdar_file, import_mdar_file
+
+LEGACY_DATA_FILES = ("mdaclient_state.json", "mda_client_local.db")
+
+
+def app_data_dir():
+    """Folder for state, keys and the local database.
+
+    MDANET_DATA_DIR overrides. Existing data in the current folder keeps being used.
+    A packaged .exe otherwise stores data in %LOCALAPPDATA%\\MDANetPro, so it works
+    when installed under Program Files. Source runs keep using the current folder.
+    """
+    override = os.environ.get("MDANET_DATA_DIR", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
+    cwd = os.getcwd()
+    if any(os.path.exists(os.path.join(cwd, name)) for name in LEGACY_DATA_FILES):
+        return cwd
+    if getattr(sys, "frozen", False):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "MDANetPro")
+        os.makedirs(path, exist_ok=True)
+        return path
+    return cwd
+
+
+def default_node_name():
+    """A per-computer default so two new users don't both end up named "node"."""
+    for value in (os.environ.get("USERNAME"), os.environ.get("USER"), socket.gethostname()):
+        value = str(value or "").strip()
+        if value:
+            return value[:32]
+    return "node"
 
 
 def parse_peer(value):
@@ -101,12 +139,15 @@ class MDAClientGUI:
         self.root.title("MDA Network Client")
         self.node = None
         self.message_queue = queue.Queue()
-        self.storage = ClientStorage(os.getcwd())
+        self.data_dir = app_data_dir()
+        self.first_run = not os.path.exists(os.path.join(self.data_dir, self.STATE_FILE))
+        self.storage = ClientStorage(self.data_dir)
         self.identity = self.storage.get_or_create_identity()
         self.active_network_var = tk.StringVar(value="lab-network")
-        self.node_name_var = tk.StringVar(value="node")
+        self.node_name_var = tk.StringVar(value=default_node_name())
         self.node_description_var = tk.StringVar(value="")
-        self.host_var = tk.StringVar(value=mda.get_local_ip())
+        self.host_mode = "auto"  # "auto": pick and follow the right IP; "manual": use host_var as typed
+        self.host_var = tk.StringVar(value=best_local_ip())
         self.port_var = tk.StringVar(value="50404")
         self.peer_entry_var = tk.StringVar(value="")
         self.broadcast_var = tk.StringVar(value="")
@@ -125,6 +166,12 @@ class MDAClientGUI:
         self.onion_body_size = mda.ONION_BODY_SIZE
         self.outgoing_real_queue = []
         self.pending_updates = {}
+        self.ui_calls = queue.Queue()  # callables from worker threads, run on the Tk thread
+        self.discovery = None
+        self.firewall_state = None
+        self.setup_done = False
+        self._nearby_window = None
+        self._hello_cache = []
         self._load_state()
         self._ensure_default_network()
         self._build_ui()
@@ -133,14 +180,25 @@ class MDAClientGUI:
         self.root.after(250, self._drain_messages)
         self.root.after(400, self._auto_start_node)
         self.root.after(self.traffic_interval_ms, self._traffic_tick)
+        self.root.after(5000, self._address_watch_tick)
+        self.root.after(1000, self._announce_tick)
+        if self.first_run or not self.setup_done:
+            self.root.after(700, self.setup_wizard)
 
     def _build_ui(self):
         self._create_menu()
 
+        # Banner shown only when something needs the user's attention (e.g. firewall).
+        self.banner = tk.Frame(self.root, background="#fff4ce", padx=10, pady=6)
+        self.banner_text_var = tk.StringVar(value="")
+        tk.Label(self.banner, textvariable=self.banner_text_var, background="#fff4ce", anchor="w", justify="left").pack(side="left", fill="x", expand=True)
+        self.banner_button = ttk.Button(self.banner, text="Allow network access", command=self.allow_network_access)
+        self.banner_button.pack(side="right")
+
         frame = ttk.Frame(self.root, padding=10)
-        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid(row=1, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
         ttk.Label(frame, text="Active Network").grid(row=0, column=0, sticky="w")
         self.active_network_selector = ttk.Combobox(
@@ -151,11 +209,11 @@ class MDAClientGUI:
             width=20,
         )
         self.active_network_selector.grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Label(frame, text="Host").grid(row=0, column=2, sticky="w")
-        ttk.Entry(frame, textvariable=self.host_var, width=18).grid(row=0, column=3, sticky="ew", padx=4)
-        ttk.Label(frame, text="Port").grid(row=0, column=4, sticky="w")
-        ttk.Entry(frame, textvariable=self.port_var, width=10).grid(row=0, column=5, sticky="ew", padx=4)
-        ttk.Button(frame, text="Detect IP", command=self._detect_ip).grid(row=0, column=6, padx=4)
+        quick = ttk.Frame(frame)
+        quick.grid(row=0, column=2, columnspan=5, sticky="w", padx=4)
+        ttk.Button(quick, text="Networks Nearby", command=self.show_nearby_networks).pack(side="left", padx=(0, 4))
+        ttk.Button(quick, text="Test Connection", command=self.test_connection).pack(side="left", padx=4)
+        ttk.Button(quick, text="Setup Wizard", command=self.setup_wizard).pack(side="left", padx=4)
 
         ttk.Button(frame, text="Start Node", command=self.start_node).grid(row=1, column=0, pady=6, sticky="ew")
         ttk.Button(frame, text="Stop Node", command=self.stop_node).grid(row=1, column=1, pady=6, sticky="ew")
@@ -206,7 +264,9 @@ class MDAClientGUI:
         network_menu = tk.Menu(menubar, tearoff=False)
         network_menu.add_command(label="Create New Network", command=self.create_network_dialog)
         network_menu.add_command(label="Edit Network Rules", command=self.edit_network_rules_dialog)
-        network_menu.add_command(label="Join a Network", command=self.join_network_dialog)
+        network_menu.add_command(label="Networks Nearby…", command=self.show_nearby_networks)
+        network_menu.add_command(label="Join by Address…", command=self.join_by_address_dialog)
+        network_menu.add_command(label="Join with .mdar File…", command=self.join_network_dialog)
         network_menu.add_command(label="Delete a Network", command=self.delete_network_dialog)
         network_menu.add_separator()
         network_menu.add_command(label="Import .mdar", command=self.import_mdar)
@@ -223,6 +283,10 @@ class MDAClientGUI:
         node_menu.add_separator()
         node_menu.add_command(label="Traffic Settings", command=self.traffic_settings_dialog)
         node_menu.add_command(label="Node Settings", command=self.node_settings_dialog)
+        node_menu.add_separator()
+        node_menu.add_command(label="Test Connection", command=self.test_connection)
+        node_menu.add_command(label="Allow Network Access (Firewall)", command=self.allow_network_access)
+        node_menu.add_command(label="Setup Wizard", command=self.setup_wizard)
         menubar.add_cascade(label="Node", menu=node_menu)
 
         experiment_menu = tk.Menu(menubar, tearoff=False)
@@ -299,7 +363,7 @@ class MDAClientGUI:
         return result["values"]
 
     def _state_path(self):
-        return os.path.join(os.getcwd(), self.STATE_FILE)
+        return os.path.join(self.data_dir, self.STATE_FILE)
 
     def _load_state(self):
         path = self._state_path()
@@ -315,8 +379,13 @@ class MDAClientGUI:
         node_data = payload.get("node", {})
         self.node_name_var.set(str(node_data.get("name", self.node_name_var.get())))
         self.node_description_var.set(str(node_data.get("description", self.node_description_var.get())))
-        self.host_var.set(str(node_data.get("host", self.host_var.get())))
+        host_mode = str(node_data.get("host_mode", "")).strip().lower()
+        if host_mode == "manual":
+            self.host_mode = "manual"
+            self.host_var.set(str(node_data.get("host", self.host_var.get())))
+        # In auto mode the saved host is ignored: the address is re-detected every start.
         self.port_var.set(str(node_data.get("port", self.port_var.get())))
+        self.setup_done = bool(payload.get("setup_done", True))
         self.active_network_var.set(str(payload.get("active_network", self.active_network_var.get())))
 
         contacts = payload.get("contacts", [])
@@ -358,6 +427,7 @@ class MDAClientGUI:
                 membership_status = info.get("membership_status")
                 if membership_status:
                     network_info["membership_status"] = str(membership_status)
+                network_info["discoverable"] = bool(info.get("discoverable", True))
                 self.networks[str(name)] = network_info
 
         traffic_settings = payload.get("traffic_settings", {})
@@ -400,8 +470,10 @@ class MDAClientGUI:
                 "name": self.node_name_var.get().strip(),
                 "description": self.node_description_var.get().strip(),
                 "host": self.host_var.get().strip(),
+                "host_mode": self.host_mode,
                 "port": self.port_var.get().strip(),
             },
+            "setup_done": bool(self.setup_done),
             "active_network": self.active_network_var.get().strip(),
             "contacts": self.contacts,
             "networks": self.networks,
@@ -592,15 +664,17 @@ class MDAClientGUI:
         self.open_selected_chat()
 
     def _detect_ip(self):
-        self.host_var.set(mda.get_local_ip())
+        self.host_mode = "auto"
+        self.host_var.set(best_local_ip())
         self._log("Detected local IP.")
         self._save_state()
 
     def _update_status(self):
         active_network = self._active_network_name()
         if self.node:
+            mode = "auto" if self.host_mode == "auto" else "manual"
             self.node_status_var.set(
-                f"Running as {self.node.nodeid} | Name: {self.node_name_var.get().strip() or 'node'} | Active network: {active_network}"
+                f"Running as {self.node.nodeid} ({mode} address) | Name: {self.node_name_var.get().strip() or 'node'} | Active network: {active_network}"
             )
         else:
             self.node_status_var.set(f"Stopped | Active network: {active_network}")
@@ -622,21 +696,45 @@ class MDAClientGUI:
         for host, port in list(target_peers - current_peers):
             self.node.add_peer(f"{host}:{port}")
 
-    def _put_node_entry(self, nodes, name, entry):
+    @staticmethod
+    def _same_pubkey(left, right):
+        left = str(left or "").strip()
+        right = str(right or "").strip()
+        return bool(left) and left == right
+
+    def _put_node_entry(self, nodes, name, entry, previous_endpoints=None):
         """Insert/update a node in a network node map without clobbering a different node.
 
-        Node maps are keyed by nickname, and nicknames are not unique (every client
-        defaults to "node"). Match by endpoint first; if the name is already used by a
-        different endpoint, store under a suffixed key instead of overwriting it.
+        A node is the same node if it has the same public key (its address may have
+        changed) or, for entries without keys, the same endpoint. Nicknames are not
+        unique, so a name already used by a different node gets a suffix (name-2...).
+        Old endpoints of a node whose address changed are appended to previous_endpoints.
         """
-        endpoint = entry.get("endpoint", "")
-        for node_key, node_entry in nodes.items():
-            if endpoint and self._extract_node_endpoint(node_entry) == endpoint:
-                if isinstance(node_entry, dict):
-                    node_entry.update(entry)
-                else:
-                    nodes[node_key] = dict(entry)
-                return node_key
+        if not isinstance(entry, dict):
+            entry = {"endpoint": self._extract_node_endpoint(entry)}
+        endpoint = self._extract_node_endpoint(entry)
+        pubkey = str(entry.get("pubkey", "")).strip()
+        match_key = None
+        if pubkey:
+            for node_key, node_entry in nodes.items():
+                if isinstance(node_entry, dict) and self._same_pubkey(node_entry.get("pubkey"), pubkey):
+                    match_key = node_key
+                    break
+        if match_key is None and endpoint:
+            for node_key, node_entry in nodes.items():
+                if self._extract_node_endpoint(node_entry) == endpoint:
+                    match_key = node_key
+                    break
+        if match_key is not None:
+            node_entry = nodes[match_key]
+            old_endpoint = self._extract_node_endpoint(node_entry)
+            if old_endpoint and endpoint and old_endpoint != endpoint and previous_endpoints is not None:
+                previous_endpoints.append(old_endpoint)
+            if isinstance(node_entry, dict):
+                node_entry.update(entry)
+            else:
+                nodes[match_key] = dict(entry)
+            return match_key
         base = str(name).strip() or endpoint or "node"
         key, suffix = base, 2
         while key in nodes:
@@ -646,36 +744,44 @@ class MDAClientGUI:
         return key
 
     def _upsert_local_node_in_networks(self):
+        """Make sure every network lists this node at its current address.
+
+        Returns the set of old endpoints this node was listed under (address changed).
+        """
         local_endpoint = self._local_endpoint()
         local_name = self.node_name_var.get().strip() or "self"
         local_pubkey = self.node.get_public_key_pem() if self.node else self.identity.get("public_key_pem", "")
+        old_endpoints = set()
         for network_name, network_info in self.networks.items():
             nodes = network_info.get("nodes", {})
             if not isinstance(nodes, dict):
                 nodes = {}
-            updated = False
-            for node_key, node_entry in list(nodes.items()):
-                endpoint = self._extract_node_endpoint(node_entry)
-                if endpoint != local_endpoint:
-                    continue
-                if not isinstance(node_entry, dict):
-                    node_entry = {"endpoint": endpoint}
-                node_entry["endpoint"] = local_endpoint
-                node_entry["nickname"] = local_name
-                node_entry["pubkey"] = local_pubkey
-                node_entry.setdefault("role", network_info.get("my_role", "member"))
-                nodes[node_key] = node_entry
-                updated = True
-            if not updated:
-                self._put_node_entry(nodes, local_name, {
-                    "endpoint": local_endpoint,
-                    "nickname": local_name,
-                    "role": network_info.get("my_role", "member"),
-                    "pubkey": local_pubkey,
-                })
+            previous = []
+            existing_role = ""
+            for node_key, node_entry in nodes.items():
+                if isinstance(node_entry, dict) and self._same_pubkey(node_entry.get("pubkey"), local_pubkey):
+                    existing_role = str(node_entry.get("role", "")).strip().lower()
+                    break
+            self._put_node_entry(nodes, local_name, {
+                "endpoint": local_endpoint,
+                "nickname": local_name,
+                "role": existing_role or network_info.get("my_role", "member"),
+                "pubkey": local_pubkey,
+            }, previous_endpoints=previous)
+            old_endpoints.update(endpoint for endpoint in previous if endpoint != local_endpoint)
             network_info["nodes"] = nodes
+        return old_endpoints
 
     def _drain_messages(self):
+        while True:
+            try:
+                call = self.ui_calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                call()
+            except Exception as exc:  # keep the UI loop alive
+                self._log(f"UI update failed: {exc}")
         while True:
             try:
                 packet = self.message_queue.get_nowait()
@@ -748,6 +854,9 @@ class MDAClientGUI:
         )
         if action == "join_request":
             self._handle_join_request(packet, network_name)
+            return
+        if action == "address_update":
+            self._handle_address_update(packet)
             return
         if action in ("join_approved", "node_list_update"):
             self._handle_signed_update_packet(packet, network_name, action, mark_active=(action == "join_approved"))
@@ -844,7 +953,12 @@ class MDAClientGUI:
                 "circuit": "",
                 "network": (network_name or self._active_network_name()),
             }
-        nickname = f"Peer-{peer.rsplit(':', 1)[-1]}" if ":" in peer else "Peer"
+        existing = self._find_contact_by_endpoint(peer)
+        if existing:
+            # Known contact: keep its real name (don't rename it to "Peer-<port>").
+            nickname = None
+        else:
+            nickname = self._nickname_for_endpoint(peer) or (f"Peer-{peer.rsplit(':', 1)[-1]}" if ":" in peer else "Peer")
         contact = self._upsert_contact(endpoint=peer, nickname=nickname, network=(network_name or self._active_network_name()))
         self._refresh_contact_list()
         self._save_state()
@@ -854,6 +968,18 @@ class MDAClientGUI:
             except ValueError:
                 self._log(f"Could not add auto-discovered contact: {peer}")
         return contact
+
+    def _nickname_for_endpoint(self, endpoint):
+        for network_info in self.networks.values():
+            nodes = network_info.get("nodes", {})
+            if not isinstance(nodes, dict):
+                continue
+            for node_key, node_entry in nodes.items():
+                if self._extract_node_endpoint(node_entry) == endpoint:
+                    nickname = self._extract_node_nickname(node_key, node_entry)
+                    if nickname:
+                        return nickname
+        return ""
 
     def add_peer(self, endpoint, nickname=None, circuit="", network_name=None):
         if not endpoint:
@@ -1235,7 +1361,7 @@ class MDAClientGUI:
         if self.node:
             self._log("Node is already running.")
             return
-        host = self.host_var.get().strip()
+        host = self._resolve_host()
         try:
             port = int(self.port_var.get().strip())
         except ValueError:
@@ -1253,24 +1379,50 @@ class MDAClientGUI:
                 private_key_pem=self.identity.get("private_key_pem", ""),
                 public_key_pem=self.identity.get("public_key_pem", ""),
                 onion_body_size=self.onion_body_size,
+                bind_host="0.0.0.0",
             )
+            self.node.hello_provider = self._hello_networks
             self.node.start_server()
         except OSError as exc:
             self.node = None
-            messagebox.showerror("Start Failed", str(exc))
+            if getattr(exc, "errno", None) in (98, 10048, 10013, 48):
+                messagebox.showerror(
+                    "Start Failed",
+                    f"Port {port} is already in use.\n\nMDANetPro may already be open on this computer. "
+                    "Close the other copy, or change the port in Node > Node Settings.",
+                )
+            else:
+                messagebox.showerror("Start Failed", str(exc))
             return
-        self._upsert_local_node_in_networks()
+        old_endpoints = self._upsert_local_node_in_networks()
+        self._refresh_hello_cache()
         self._sync_node_peers_for_active_network()
+        self._start_discovery()
         self._update_status()
         self._log(f"Node started on {self.node.nodeid}")
         self._save_state()
+        if old_endpoints:
+            self._log(f"Your address changed ({', '.join(sorted(old_endpoints))} -> {self.node.nodeid}); telling your networks.")
+            self._announce_address_change(old_endpoints)
+        self._check_firewall_async()
 
     def stop_node(self):
+        if self.discovery is not None:
+            self.discovery.stop()
+            self.discovery = None
         if self.node:
             self.node.close()
             self.node = None
             self._log("Node stopped.")
         self._update_status()
+
+    def _resolve_host(self):
+        """Address to advertise: typed value in manual mode, otherwise auto-detected."""
+        if self.host_mode == "manual" and self.host_var.get().strip():
+            return self.host_var.get().strip()
+        host = best_local_ip()
+        self.host_var.set(host)
+        return host
 
     def node_settings_dialog(self):
         values = self._show_form_dialog(
@@ -1278,7 +1430,7 @@ class MDAClientGUI:
             [
                 {"name": "name", "label": "Node name", "initial": self.node_name_var.get()},
                 {"name": "description", "label": "Node description", "initial": self.node_description_var.get()},
-                {"name": "host", "label": "Host", "initial": self.host_var.get()},
+                {"name": "host", "label": "Address (\"auto\" = detect automatically)", "initial": "auto" if self.host_mode == "auto" else self.host_var.get()},
                 {"name": "port", "label": "Port", "initial": self.port_var.get()},
             ],
             submit_label="Save Settings",
@@ -1294,14 +1446,25 @@ class MDAClientGUI:
         except ValueError:
             messagebox.showerror("Invalid Port", "Port must be a number.")
             return
-        self.node_name_var.set(name.strip() or "node")
+        self.node_name_var.set(name.strip() or default_node_name())
         self.node_description_var.set(description.strip())
-        self.host_var.set(host.strip())
+        host = host.strip()
+        if not host or host.lower() == "auto":
+            self.host_mode = "auto"
+            new_host = best_local_ip()
+        else:
+            self.host_mode = "manual"
+            new_host = host
+        self.host_var.set(new_host)
+        port_changed = self.node is not None and str(self.node.port) != port_text.strip()
         self.port_var.set(port_text.strip())
-        self._upsert_local_node_in_networks()
+        if self.node and not port_changed and new_host != self.node.host:
+            self._change_address(new_host, reason="settings")
+        else:
+            self._upsert_local_node_in_networks()
         self._update_status()
         self._save_state()
-        self._log("Node settings updated.")
+        self._log("Node settings updated." + (" Restart the node (Stop/Start) to use the new port." if port_changed else ""))
 
     def send_message(self):
         if not self.node:
@@ -1673,16 +1836,18 @@ class MDAClientGUI:
                 self._log(f"Join request failed to {endpoint}: {exc}")
 
         if sent_count == 0:
-            messagebox.showwarning(
+            if messagebox.askyesno(
                 "Join Network",
-                "Join request could not be sent to any external seed/trusted node.\n"
-                "This usually means the .mdar points to this same computer instead of the seed computer.",
-            )
+                "Could not reach the network owner's computer.\n\n"
+                "Make sure it is switched on, has MDANetPro open, and is on the same network as you.\n\n"
+                "Run a connection test now?",
+            ):
+                self.test_connection()
             return
         messagebox.showinfo(
             "Join Network",
             f"Join request sent to {sent_count} node(s).\n"
-            "Wait for seed/trusted approval and updated .mdar.",
+            "You will be notified here when the network owner approves it.",
         )
 
     def _send_control_message(self, endpoint, payload, timeout=5):
@@ -1735,13 +1900,20 @@ class MDAClientGUI:
         except (TypeError, ValueError):
             info["min_approvals"] = max(1, int(info.get("min_approvals", 2)))
 
+        was_pending = info.get("membership_status") == "pending_approval"
         merged_nodes = {}
         existing_nodes = info.get("nodes", {})
         if isinstance(existing_nodes, dict):
-            merged_nodes.update(existing_nodes)
+            merged_nodes.update({key: (dict(value) if isinstance(value, dict) else value) for key, value in existing_nodes.items()})
         incoming_nodes = packet.get("nodes", {})
         if isinstance(incoming_nodes, dict):
-            merged_nodes.update(incoming_nodes)
+            for node_key, node_entry in incoming_nodes.items():
+                previous = []
+                self._put_node_entry(merged_nodes, node_key, node_entry, previous_endpoints=previous)
+                new_endpoint = self._extract_node_endpoint(node_entry)
+                for old_endpoint in previous:
+                    if old_endpoint != self._local_endpoint():
+                        self._rename_endpoint(old_endpoint, new_endpoint)
         info["nodes"] = merged_nodes
         inferred_role = self._infer_my_role_from_nodes(merged_nodes)
         if inferred_role:
@@ -1781,7 +1953,12 @@ class MDAClientGUI:
         self._sync_node_peers_for_active_network()
         self._refresh_contact_list()
         self._save_state()
+        self._refresh_hello_cache()
         self._log(f"Network '{network_name}' synchronized ({added} contacts refreshed).")
+        if mark_active and was_pending:
+            if self._nearby_window is not None:
+                self._render_nearby()
+            messagebox.showinfo("Joined", f"You joined '{network_name}'.\n\nThe members now appear in your contacts.")
 
     def _handle_join_request(self, packet, network_name):
         if not network_name:
@@ -1828,12 +2005,15 @@ class MDAClientGUI:
         if requested_role in ("trusted", "seed") and my_role != "seed":
             requested_role = "member"
         requester_pubkey = str(packet.get("public_key", "")).strip()
+        previous = []
         self._put_node_entry(nodes, requester_name, {
             "endpoint": sender_endpoint,
             "role": requested_role,
             "nickname": requester_name,
             "pubkey": requester_pubkey,
-        })
+        }, previous_endpoints=previous)
+        for old_endpoint in previous:
+            self._rename_endpoint(old_endpoint, sender_endpoint)
         network_info["nodes"] = nodes
         self.networks[network_name] = network_info
         self._upsert_contact(endpoint=sender_endpoint, nickname=requester_name, network=network_name)
@@ -1883,6 +2063,7 @@ class MDAClientGUI:
                 {"name": "min_approvals", "label": "Min approvals for updates", "initial": "2"},
                 {"name": "description", "label": "Description", "initial": ""},
                 {"name": "rules", "label": "Rules (comma-separated)", "initial": "allow-lab-communication"},
+                {"name": "discoverable", "label": "Show in 'Networks Nearby'", "initial": "yes", "kind": "combobox", "options": ["yes", "no"]},
             ],
             submit_label="Create Network",
         )
@@ -1905,26 +2086,32 @@ class MDAClientGUI:
         except ValueError:
             messagebox.showerror("Create Network", "Min approvals must be numeric.")
             return
-        description = values.get("description", "")
         rules_raw = values.get("rules", "")
         rules = [item.strip() for item in rules_raw.split(",") if item.strip()]
+        discoverable = str(values.get("discoverable", "yes")).strip().lower() not in ("no", "false", "0")
+        self._create_network(name, net_type, my_role, min_approvals, values.get("description", ""), rules, discoverable)
+
+    def _create_network(self, name, net_type="private", my_role="seed", min_approvals=2, description="", rules=None, discoverable=True):
         self.networks[name] = {
             "type": net_type,
-            "description": description.strip(),
-            "rules": rules,
+            "description": str(description or "").strip(),
+            "rules": list(rules or []),
             "nodes": {},
             "membership_status": "active",
             "my_role": my_role,
             "min_approvals": min_approvals,
+            "discoverable": bool(discoverable),
         }
-        local_endpoint = self._local_endpoint()
-        self.networks[name]["nodes"][self.node_name_var.get().strip() or "self"] = {
-            "endpoint": local_endpoint,
+        local_name = self.node_name_var.get().strip() or "self"
+        self.networks[name]["nodes"][local_name] = {
+            "endpoint": self._local_endpoint(),
             "role": my_role,
-            "nickname": self.node_name_var.get().strip() or "self",
+            "nickname": local_name,
             "pubkey": self.identity.get("public_key_pem", ""),
         }
+        self._refresh_active_network_selector()
         self.active_network_var.set(name)
+        self._refresh_hello_cache()
         self._log(f"Network created: {name}")
         self._save_state()
 
@@ -2038,38 +2225,68 @@ class MDAClientGUI:
             messagebox.showerror("Join Network", "Min approvals must be numeric.")
             return
         rules_raw = values.get("rules", "")
+        self._join_network(
+            name=name,
+            net_type=net_type,
+            description=values.get("description", "").strip(),
+            rules=[item.strip() for item in rules_raw.split(",") if item.strip()],
+            nodes=payload_nodes_raw,
+            my_role=my_role,
+            min_approvals=min_approvals,
+        )
+
+    def _join_network(self, name, net_type, description, rules, nodes, my_role="member", min_approvals=2):
+        """Store a pending membership for `name` and ask its seed/trusted nodes to let us in."""
+        nodes = {key: (dict(value) if isinstance(value, dict) else value) for key, value in (nodes or {}).items()}
+        join_targets = self._collect_join_targets(nodes)
         network_entry = self.networks.get(name, {"nodes": {}})
         network_entry["type"] = net_type
-        network_entry["description"] = values.get("description", "").strip()
-        network_entry["rules"] = [item.strip() for item in rules_raw.split(",") if item.strip()]
-        network_entry["nodes"] = payload_nodes_raw
+        network_entry["description"] = description
+        network_entry["rules"] = list(rules or [])
+        network_entry["nodes"] = nodes
         network_entry["membership_status"] = "pending_approval"
         network_entry["my_role"] = my_role
         network_entry["min_approvals"] = min_approvals
-        local_name = self.node_name_var.get().strip() or "self"
-        local_endpoint = self._local_endpoint()
-        nodes_map = network_entry.get("nodes", {})
-        if isinstance(nodes_map, dict):
-            self._put_node_entry(nodes_map, local_name, {
-                "endpoint": local_endpoint,
-                "role": my_role,
-                "nickname": local_name,
-                "pubkey": self.identity.get("public_key_pem", ""),
-            })
-            network_entry["nodes"] = nodes_map
+        network_entry.setdefault("discoverable", True)
         self.networks[name] = network_entry
+        # Use the adapter that actually reaches the seed (e.g. cable, not Wi-Fi) before
+        # adding ourselves, so the seed gets an address it can reply to.
+        self._adjust_address_for_targets(join_targets)
+        local_name = self.node_name_var.get().strip() or "self"
+        self._put_node_entry(nodes, local_name, {
+            "endpoint": self._local_endpoint(),
+            "role": my_role,
+            "nickname": local_name,
+            "pubkey": self.identity.get("public_key_pem", ""),
+        })
 
+        self._refresh_active_network_selector()
         self.active_network_var.set(name)
         self._log(f"Loaded join profile for network: {name}")
         if join_targets:
             self._log(f"Join targets for '{name}': {', '.join(join_targets)}")
         else:
             self._log(
-                f"No external seed/trusted targets found in .mdar for '{name}'. "
-                "Re-export from the seed computer."
+                f"No external seed/trusted targets found for '{name}'. "
+                "Re-export the .mdar from the seed computer."
             )
-        self._request_network_join(name, join_targets)
         self._save_state()
+        self._request_network_join(name, join_targets)
+
+    def _adjust_address_for_targets(self, endpoints):
+        if not self.node or self.host_mode != "auto":
+            return
+        local_ips = candidate_ips()
+        for endpoint in endpoints or []:
+            try:
+                host, _port = parse_peer(endpoint)
+            except (ValueError, AttributeError):
+                continue
+            route_ip = local_ip_for(host)
+            if route_ip and route_ip in local_ips:
+                if route_ip != self.node.host:
+                    self._change_address(route_ip, reason=f"route to {host}")
+                return
 
     def delete_network_dialog(self):
         if not self.networks:
@@ -2317,14 +2534,727 @@ class MDAClientGUI:
         ttk.Button(header, text="Refresh", command=render).grid(row=0, column=1, padx=(10, 0))
         render()
 
+    # ------------------------------------------------------------------
+    # Automatic address: follow IP changes and tell the other nodes
+    # ------------------------------------------------------------------
+    def _rename_endpoint(self, old_endpoint, new_endpoint):
+        """Point contacts, chats, queued messages and peers at a node's new address."""
+        if not old_endpoint or not new_endpoint or old_endpoint == new_endpoint:
+            return
+        for contact in self.contacts:
+            if contact.get("endpoint") == old_endpoint:
+                contact["endpoint"] = new_endpoint
+        if old_endpoint in self.chat_windows:
+            window = self.chat_windows.pop(old_endpoint)
+            window.peer = new_endpoint
+            self.chat_windows[new_endpoint] = window
+        for item in self.outgoing_real_queue:
+            if item.get("receiver") == old_endpoint:
+                item["receiver"] = new_endpoint
+        if self.node:
+            try:
+                self.node.remove_peer(old_endpoint)
+            except ValueError:
+                pass
+        self._sync_node_peers_for_active_network()
+        self._refresh_contact_list()
+
+    def _change_address(self, new_host, reason=""):
+        if not self.node or not new_host or new_host == self.node.host:
+            return
+        old_endpoint = self.node.set_advertised_host(new_host)
+        self.host_var.set(new_host)
+        changed = self._upsert_local_node_in_networks()
+        changed.add(old_endpoint)
+        changed.discard(self.node.nodeid)
+        self._refresh_hello_cache()
+        self._update_status()
+        self._save_state()
+        suffix = f" ({reason})" if reason else ""
+        self._log(f"Address changed to {self.node.nodeid}{suffix}; telling your networks.")
+        self._announce_address_change(changed)
+
+    def _address_signable(self, old_endpoint, new_endpoint, timestamp, pubkey):
+        return {
+            "action": "address_update",
+            "old": old_endpoint,
+            "new": new_endpoint,
+            "time": timestamp,
+            "pubkey_sha256": hashlib.sha256(pubkey.encode("utf-8")).hexdigest(),
+        }
+
+    def _announce_address_change(self, old_endpoints):
+        if not self.node or not old_endpoints:
+            return
+        new_endpoint = self.node.nodeid
+        pubkey = self.identity.get("public_key_pem", "")
+        try:
+            private_key = RSA.import_key(self.identity.get("private_key_pem", ""))
+        except (ValueError, TypeError):
+            self._log("Address update not sent: identity key unavailable.")
+            return
+        timestamp = time.time()
+        payloads = []
+        for old_endpoint in sorted(old_endpoints):
+            if old_endpoint == new_endpoint:
+                continue
+            digest = SHA256.new(self._canonical_json_bytes(self._address_signable(old_endpoint, new_endpoint, timestamp, pubkey)))
+            payloads.append({
+                "type": "control",
+                "action": "address_update",
+                "network": "",
+                "old_endpoint": old_endpoint,
+                "new_endpoint": new_endpoint,
+                "pubkey": pubkey,
+                "time": timestamp,
+                "signature": base64.b64encode(pss.new(private_key).sign(digest)).decode("ascii"),
+                "sender": new_endpoint,
+            })
+        if not payloads:
+            return
+        skip = set(old_endpoints) | {new_endpoint}
+        targets = set()
+        for network_name in self.networks:
+            targets.update(self._network_endpoints(network_name))
+        targets.update(contact.get("endpoint", "") for contact in self.contacts)
+        targets = sorted(endpoint for endpoint in targets if endpoint and endpoint not in skip)
+        node = self.node
+
+        def worker():
+            told = 0
+            for endpoint in targets:
+                try:
+                    for payload in payloads:
+                        node.send_control_message(endpoint, payload, timeout=3)
+                    told += 1
+                except (OSError, ValueError):
+                    continue
+            self.ui_calls.put(lambda: self._log(f"Address update delivered to {told}/{len(targets)} node(s)."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_address_update(self, packet):
+        old_endpoint = str(packet.get("old_endpoint", "")).strip()
+        new_endpoint = str(packet.get("new_endpoint", "")).strip()
+        pubkey = str(packet.get("pubkey", "")).strip()
+        try:
+            timestamp = float(packet.get("time", 0))
+            parse_peer(new_endpoint)
+            signature = base64.b64decode(str(packet.get("signature", "")).encode("ascii"))
+            digest = SHA256.new(self._canonical_json_bytes(self._address_signable(old_endpoint, new_endpoint, timestamp, pubkey)))
+            pss.new(RSA.import_key(pubkey)).verify(digest, signature)
+        except (ValueError, TypeError, AttributeError):
+            self._log(f"Ignored address update with an invalid signature (claimed {old_endpoint} -> {new_endpoint}).")
+            return
+        if abs(time.time() - timestamp) > 24 * 3600:
+            self._log(f"Ignored stale address update for {old_endpoint}.")
+            return
+        previous = set()
+        nickname = ""
+        for network_info in self.networks.values():
+            nodes = network_info.get("nodes", {})
+            if not isinstance(nodes, dict):
+                continue
+            for node_key, node_entry in nodes.items():
+                if not isinstance(node_entry, dict) or not self._same_pubkey(node_entry.get("pubkey"), pubkey):
+                    continue
+                if float(node_entry.get("addr_time", 0) or 0) >= timestamp:
+                    continue
+                current = self._extract_node_endpoint(node_entry)
+                if current and current != new_endpoint:
+                    previous.add(current)
+                node_entry["endpoint"] = new_endpoint
+                node_entry["addr_time"] = timestamp
+                nickname = nickname or self._extract_node_nickname(node_key, node_entry)
+        if not previous:
+            if not any(
+                isinstance(entry, dict) and self._same_pubkey(entry.get("pubkey"), pubkey)
+                for info in self.networks.values() for entry in (info.get("nodes", {}) or {}).values()
+            ):
+                self._log(f"Ignored address update from an unknown node ({new_endpoint}).")
+            return
+        previous.add(old_endpoint)
+        for endpoint in previous:
+            self._rename_endpoint(endpoint, new_endpoint)
+        self._save_state()
+        self._log(f"{nickname or 'A node'} moved to {new_endpoint} (was {', '.join(sorted(previous))}).")
+
+    def _address_watch_tick(self):
+        """Every few seconds: if our address disappeared (Wi-Fi off, cable plugged), follow it."""
+        try:
+            if self.node and self.host_mode == "auto":
+                local_ips = candidate_ips()
+                if self.node.host not in local_ips:
+                    new_host = best_local_ip()
+                    if new_host and new_host != "127.0.0.1" and new_host != self.node.host:
+                        self._change_address(new_host, reason="network changed")
+        finally:
+            self.root.after(5000, self._address_watch_tick)
+
+    # ------------------------------------------------------------------
+    # Networks nearby (LAN discovery) and join by address
+    # ------------------------------------------------------------------
+    def _network_summary(self, network_name, info):
+        local_pubkey = self.identity.get("public_key_pem", "")
+        return {
+            "network": network_name,
+            "type": str(info.get("type", "private")),
+            "description": str(info.get("description", ""))[:160],
+            "rules": [str(rule)[:40] for rule in (info.get("rules") or [])][:5],
+            "min_approvals": int(info.get("min_approvals", 2) or 2),
+            "endpoint": self._local_endpoint(),
+            "role": str(info.get("my_role", "member")),
+            "nickname": self.node_name_var.get().strip() or "node",
+            "pubkey": local_pubkey,
+        }
+
+    def _refresh_hello_cache(self):
+        """Snapshot of the networks this node can admit people to (read by network threads)."""
+        summaries = []
+        for network_name, info in self.networks.items():
+            if str(info.get("my_role", "member")).lower() not in ("seed", "trusted"):
+                continue
+            if info.get("membership_status", "active") != "active" or not info.get("discoverable", True):
+                continue
+            summaries.append(self._network_summary(network_name, info))
+        self._hello_cache = summaries
+
+    def _hello_networks(self):
+        return list(getattr(self, "_hello_cache", []))
+
+    def _start_discovery(self):
+        if self.discovery is not None:
+            return
+        self.discovery = LanDiscovery(DISCOVERY_PORT, own_endpoint_getter=self._local_endpoint).start()
+        if self.discovery.listen_error:
+            self._log(f"Networks Nearby is unavailable (port {DISCOVERY_PORT}: {self.discovery.listen_error}). Use Join by Address.")
+
+    def _announce_tick(self):
+        try:
+            if self.node and self.discovery is not None:
+                announcements = [LanDiscovery.build_announcement(item["network"], item) for item in self._hello_networks()]
+                if announcements:
+                    self.discovery.announce(announcements)
+        except Exception as exc:
+            self._log(f"Announcement failed: {exc}")
+        finally:
+            self.root.after(3000, self._announce_tick)
+
+    def _membership_label(self, network_name):
+        info = self.networks.get(network_name)
+        if not info:
+            return ""
+        status = info.get("membership_status", "active")
+        return "you are a member" if status == "active" else "waiting for approval"
+
+    def show_nearby_networks(self):
+        if not self.node:
+            self.start_node()
+            if not self.node:
+                return
+        if self._nearby_window is not None:
+            try:
+                self._nearby_window.lift()
+                return
+            except tk.TclError:
+                self._nearby_window = None
+        window = tk.Toplevel(self.root)
+        window.title("Networks Nearby")
+        window.geometry("620x340")
+        self._nearby_window = window
+        body = ttk.Frame(window, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Networks on this Wi-Fi / cable network. Select one and click Join.").pack(anchor="w")
+        columns = ("network", "owner", "type", "status")
+        tree = ttk.Treeview(body, columns=columns, show="headings", height=9, selectmode="browse")
+        for column, title, width in (("network", "Network", 170), ("owner", "Owner", 190), ("type", "Type", 70), ("status", "", 150)):
+            tree.heading(column, text=title)
+            tree.column(column, width=width, anchor="w")
+        tree.pack(fill="both", expand=True, pady=6)
+        self._nearby_tree = tree
+        self._nearby_hint_var = tk.StringVar(master=window, value="")
+        ttk.Label(body, textvariable=self._nearby_hint_var, foreground="#555", wraplength=580, justify="left").pack(anchor="w")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(6, 0))
+        ttk.Button(buttons, text="Join", command=self._join_selected_nearby).pack(side="left")
+        ttk.Button(buttons, text="Join by Address…", command=self.join_by_address_dialog).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Use .mdar File…", command=self.join_network_dialog).pack(side="left")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        tree.bind("<Double-Button-1>", lambda _e: self._join_selected_nearby())
+        window.bind("<Destroy>", lambda e: setattr(self, "_nearby_window", None) if e.widget is window else None)
+        self._nearby_items = {}
+        self._render_nearby()
+
+    def _render_nearby(self):
+        window = self._nearby_window
+        if window is None:
+            return
+        try:
+            if not window.winfo_exists():
+                self._nearby_window = None
+                return
+        except tk.TclError:
+            self._nearby_window = None
+            return
+        items = self.discovery.nearby() if self.discovery is not None else []
+        tree = self._nearby_tree
+        selected = tree.selection()
+        tree.delete(*tree.get_children())
+        self._nearby_items = {}
+        for index, item in enumerate(items):
+            iid = f"n{index}"
+            host = str(item.get("endpoint", "")).rsplit(":", 1)[0]
+            owner = f"{item.get('nickname', '?')} ({host})"
+            tree.insert("", "end", iid=iid, values=(item.get("network", ""), owner, item.get("type", ""), self._membership_label(item.get("network", ""))))
+            self._nearby_items[iid] = item
+        for iid in selected:
+            if iid in self._nearby_items:
+                tree.selection_set(iid)
+        if items:
+            self._nearby_hint_var.set("Joining sends a request; the network owner must approve it.")
+        else:
+            self._nearby_hint_var.set(
+                "Looking for networks… Nothing yet? The owner's computer must have MDANetPro open, and some Wi-Fi "
+                "networks block this kind of discovery. Ask the owner for their address and use 'Join by Address'."
+            )
+        window.after(1500, self._render_nearby)
+
+    def _join_selected_nearby(self):
+        selection = self._nearby_tree.selection() if self._nearby_window is not None else ()
+        if not selection:
+            messagebox.showinfo("Networks Nearby", "Select a network first.", parent=self._nearby_window)
+            return
+        item = self._nearby_items.get(selection[0])
+        if item:
+            self._join_from_summary(item, parent=self._nearby_window)
+
+    def _join_from_summary(self, summary, parent=None):
+        name = str(summary.get("network", "")).strip()
+        endpoint = str(summary.get("endpoint", "")).strip()
+        if not name or not endpoint:
+            return
+        existing = self.networks.get(name)
+        if existing and existing.get("membership_status", "active") == "active":
+            messagebox.showinfo("Join Network", f"You are already a member of '{name}'.", parent=parent or self.root)
+            return
+        owner = summary.get("nickname", "the owner")
+        if not messagebox.askyesno("Join Network", f"Ask {owner} to let you join '{name}'?", parent=parent or self.root):
+            return
+        nodes = {
+            str(owner): {
+                "endpoint": endpoint,
+                "role": str(summary.get("role", "seed")),
+                "nickname": str(owner),
+                "pubkey": str(summary.get("pubkey", "")),
+            }
+        }
+        net_type = str(summary.get("type", "private")).lower()
+        try:
+            min_approvals = max(1, int(summary.get("min_approvals", 2)))
+        except (TypeError, ValueError):
+            min_approvals = 2
+        self._join_network(
+            name=name,
+            net_type=net_type if net_type in ("private", "public") else "private",
+            description=str(summary.get("description", "")),
+            rules=[str(rule) for rule in (summary.get("rules") or []) if str(rule).strip()],
+            nodes=nodes,
+            my_role="member",
+            min_approvals=min_approvals,
+        )
+
+    def join_by_address_dialog(self):
+        if not self.node:
+            self.start_node()
+            if not self.node:
+                return
+        values = self._show_form_dialog(
+            "Join by Address",
+            [{"name": "address", "label": "Network owner's address (e.g. 192.168.1.20)", "initial": ""}],
+            submit_label="Find Networks",
+        )
+        if not values:
+            return
+        address = values.get("address", "").strip()
+        if not address:
+            return
+        endpoint = address if ":" in address else f"{address}:{mda.PORT}"
+        try:
+            parse_peer(endpoint)
+        except ValueError:
+            messagebox.showerror("Join by Address", f"'{address}' is not a valid address.")
+            return
+        node = self.node
+        self._log(f"Looking up networks at {endpoint}…")
+
+        def worker():
+            try:
+                reply = node.hello(endpoint, timeout=6)
+                error = "" if reply else "That computer runs an older MDANetPro version."
+            except (OSError, ValueError) as exc:
+                reply, error = None, str(exc) or exc.__class__.__name__
+            self.ui_calls.put(lambda: self._finish_join_by_address(endpoint, reply, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_join_by_address(self, endpoint, reply, error):
+        if reply is None:
+            if messagebox.askyesno(
+                "Join by Address",
+                f"Could not reach {endpoint}.\n\n{error}\n\n"
+                "Check that the owner's computer is on, has MDANetPro open, and that you are on the same network.\n\n"
+                "Run a connection test?",
+            ):
+                self.test_connection(extra_targets=[endpoint])
+            return
+        networks = [item for item in reply.get("networks", []) if isinstance(item, dict) and item.get("network")]
+        if not networks:
+            messagebox.showinfo("Join by Address", "That computer is reachable, but it has no networks open for joining.")
+            return
+        if len(networks) == 1:
+            self._join_from_summary(networks[0])
+            return
+        names = [item["network"] for item in networks]
+        values = self._show_form_dialog(
+            "Choose Network",
+            [{"name": "network", "label": "Network", "initial": names[0], "kind": "combobox", "options": names}],
+            submit_label="Join",
+        )
+        if values:
+            chosen = next((item for item in networks if item["network"] == values.get("network")), None)
+            if chosen:
+                self._join_from_summary(chosen)
+
+    # ------------------------------------------------------------------
+    # Firewall
+    # ------------------------------------------------------------------
+    def _node_port(self):
+        try:
+            return int(self.node.port if self.node else self.port_var.get().strip())
+        except (TypeError, ValueError):
+            return mda.PORT
+
+    def _check_firewall_async(self, then=None):
+        if not mda_firewall.is_supported():
+            self._apply_firewall_state({"supported": False, "ok": True}, then)
+            return
+        port = self._node_port()
+
+        def worker():
+            state = mda_firewall.check_firewall(port, DISCOVERY_PORT)
+            self.ui_calls.put(lambda: self._apply_firewall_state(state, then))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_firewall_state(self, state, then=None):
+        self.firewall_state = state
+        if state.get("supported") and not state.get("ok"):
+            if state.get("error"):
+                self.banner_text_var.set("Could not check Windows Firewall. If others can't connect to you, click 'Allow network access'.")
+            else:
+                self.banner_text_var.set("Other computers can't connect to you yet: Windows Firewall is blocking MDANetPro.")
+            self.banner.grid(row=0, column=0, sticky="ew")
+        else:
+            self.banner.grid_remove()
+        if callable(then):
+            then(state)
+
+    def allow_network_access(self, then=None):
+        if not mda_firewall.is_supported():
+            messagebox.showinfo("Network Access", "Nothing to do: this computer does not use Windows Firewall.")
+            return
+        port = self._node_port()
+        self.banner_text_var.set("Waiting for Windows permission… (click Yes on the Windows prompt)")
+        self.banner.grid(row=0, column=0, sticky="ew")
+
+        def worker():
+            started, message = mda_firewall.allow_network_access(port, DISCOVERY_PORT)
+            state = mda_firewall.check_firewall(port, DISCOVERY_PORT)
+
+            def done():
+                self._apply_firewall_state(state)
+                if state.get("ok"):
+                    self._log("Network access allowed in Windows Firewall.")
+                    messagebox.showinfo("Network Access", "Done. Other computers can now connect to you.")
+                elif not started:
+                    messagebox.showwarning("Network Access", message)
+                else:
+                    messagebox.showwarning(
+                        "Network Access",
+                        "The rules were added, but something is still blocking.\n\n"
+                        "If you use another security program (Kaspersky, Avast, ESET…), allow MDANetPro there too.",
+                    )
+                if callable(then):
+                    then(state)
+
+            self.ui_calls.put(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Test connection
+    # ------------------------------------------------------------------
+    def _test_targets(self, network_name):
+        info = self.networks.get(network_name, {})
+        nodes = info.get("nodes", {}) if isinstance(info.get("nodes", {}), dict) else {}
+        local = self._local_endpoint()
+        rank = {"seed": 0, "trusted": 1}
+        targets = []
+        for node_key, node_entry in nodes.items():
+            endpoint = self._extract_node_endpoint(node_entry)
+            if not endpoint or endpoint == local:
+                continue
+            if isinstance(node_entry, dict) and self._same_pubkey(node_entry.get("pubkey"), self.identity.get("public_key_pem", "")):
+                continue
+            role = self._extract_node_role(node_key, node_entry)
+            name = self._extract_node_nickname(node_key, node_entry) or endpoint
+            targets.append((rank.get(role, 2), name, endpoint, role))
+        targets.sort()
+        return [(name, endpoint, role) for _rank, name, endpoint, role in targets[:6]]
+
+    def test_connection(self, extra_targets=None):
+        if not self.node:
+            self.start_node()
+            if not self.node:
+                return
+        network_name = self._active_network_name()
+        targets = self._test_targets(network_name)
+        for endpoint in extra_targets or []:
+            if endpoint not in [item[1] for item in targets]:
+                targets.insert(0, (endpoint, endpoint, ""))
+
+        window = tk.Toplevel(self.root)
+        window.title("Connection Test")
+        window.geometry("600x380")
+        body = ttk.Frame(window, padding=10)
+        body.pack(fill="both", expand=True)
+        text = scrolledtext.ScrolledText(body, height=14, wrap="word", state="normal")
+        text.pack(fill="both", expand=True)
+        text.insert(tk.END, "Testing… this can take a few seconds.\n")
+        text.configure(state="disabled")
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(8, 0))
+        fix_firewall = ttk.Button(buttons, text="Allow network access", command=lambda: self.allow_network_access(then=lambda _s: rerun()))
+        fix_address = ttk.Button(buttons, text="Use suggested address")
+        ttk.Button(buttons, text="Close", command=window.destroy).pack(side="right")
+        ttk.Button(buttons, text="Test again", command=lambda: rerun()).pack(side="right", padx=6)
+        node = self.node
+        port = self._node_port()
+
+        def rerun():
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+            self.test_connection(extra_targets=extra_targets)
+
+        def worker():
+            firewall = mda_firewall.check_firewall(port, DISCOVERY_PORT) if mda_firewall.is_supported() else {"supported": False, "ok": True}
+            results = [(name, endpoint, role, node.probe_reachability(endpoint, timeout=8)) for name, endpoint, role in targets]
+            self.ui_calls.put(lambda: show(firewall, results))
+
+        def show(firewall, results):
+            self._apply_firewall_state(firewall)
+            try:
+                if not window.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            lines = [f"Your address: {node.nodeid}   Network: {network_name}", ""]
+            need_firewall = firewall.get("supported") and not firewall.get("ok")
+            suggested = ""
+            if firewall.get("supported"):
+                lines.append("✅ Windows Firewall allows MDANetPro." if firewall.get("ok") else "❌ Windows Firewall is blocking MDANetPro on this computer.")
+                lines.append("")
+            if not results:
+                lines.append(f"There are no other computers in '{network_name}' yet.")
+                lines.append("When someone joins, run this test again." if not need_firewall else "Click 'Allow network access' so others can join you.")
+            local_ips = candidate_ips()
+            for name, endpoint, role, result in results:
+                label = f"{name} ({endpoint})" + (f" [{role}]" if role else "")
+                if not result["connect_ok"]:
+                    lines.append(f"❌ {label}: can't reach it.")
+                    lines.append("    It may be switched off, not running MDANetPro, on a different network, or its firewall is blocking.")
+                    lines.append("    Ask its owner to open MDANetPro and click 'Allow network access'.")
+                elif result["callback_ok"]:
+                    lines.append(f"✅ {label}: connected both ways.")
+                else:
+                    need_firewall = need_firewall or mda_firewall.is_supported()
+                    lines.append(f"⚠️ {label}: you can reach it, but it can't reach you back.")
+                    lines.append("    This computer is blocking incoming connections. Click 'Allow network access'.")
+                    if result.get("error"):
+                        lines.append(f"    ({result['error']})")
+                seen_ip = result.get("seen_ip", "")
+                if result["connect_ok"] and seen_ip and seen_ip != node.host:
+                    if seen_ip in local_ips:
+                        suggested = seen_ip
+                        lines.append(f"    It sees you as {seen_ip}, but you announce {node.host}. Click 'Use suggested address'.")
+                    else:
+                        lines.append(f"    It sees you as {seen_ip} (a router is translating addresses); replies may not reach you.")
+                lines.append("")
+            text.configure(state="normal")
+            text.delete("1.0", tk.END)
+            text.insert(tk.END, "\n".join(lines))
+            text.configure(state="disabled")
+            if need_firewall:
+                fix_firewall.pack(side="left")
+            if suggested:
+                fix_address.configure(command=lambda: (self._set_auto_address(suggested), rerun()))
+                fix_address.pack(side="left", padx=6)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_auto_address(self, host):
+        self._change_address(host, reason="connection test")
+
+    # ------------------------------------------------------------------
+    # First-run wizard
+    # ------------------------------------------------------------------
+    def setup_wizard(self):
+        if getattr(self, "_wizard", None) is not None:
+            try:
+                self._wizard.lift()
+                return
+            except tk.TclError:
+                pass
+        wizard = tk.Toplevel(self.root)
+        self._wizard = wizard
+        wizard.title("Welcome to MDANetPro")
+        wizard.geometry("520x340")
+        wizard.resizable(False, False)
+        wizard.transient(self.root)
+        wizard.bind("<Destroy>", lambda e: setattr(self, "_wizard", None) if e.widget is wizard else None)
+        container = ttk.Frame(wizard, padding=18)
+        container.pack(fill="both", expand=True)
+        pages = []
+
+        def finish():
+            self.setup_done = True
+            self._save_state()
+            try:
+                wizard.destroy()
+            except tk.TclError:
+                pass
+
+        def show(index):
+            for page in pages:
+                page.pack_forget()
+            pages[index].pack(fill="both", expand=True)
+
+        # Page 1: name
+        page1 = ttk.Frame(container)
+        ttk.Label(page1, text="Step 1 of 3 — Your name", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+        ttk.Label(page1, text="This is the name other people will see when you join or create a network.", wraplength=460).pack(anchor="w", pady=(8, 12))
+        name_var = tk.StringVar(master=wizard, value=self.node_name_var.get())
+        name_entry = ttk.Entry(page1, textvariable=name_var, width=32)
+        name_entry.pack(anchor="w")
+
+        def page1_next():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Your name", "Please enter a name.", parent=wizard)
+                return
+            self.node_name_var.set(name[:32])
+            self._upsert_local_node_in_networks()
+            self._refresh_hello_cache()
+            self._update_status()
+            self._save_state()
+            if mda_firewall.is_supported():
+                show(1)
+                refresh_firewall()
+            else:
+                show(2)
+
+        ttk.Button(page1, text="Next →", command=page1_next).pack(side="bottom", anchor="e")
+        pages.append(page1)
+
+        # Page 2: firewall
+        page2 = ttk.Frame(container)
+        ttk.Label(page2, text="Step 2 of 3 — Allow connections", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+        ttk.Label(
+            page2,
+            text="Windows must allow other computers to connect to MDANetPro. Click the button and answer "
+                 "'Yes' on the Windows prompt. You only need to do this once.",
+            wraplength=460, justify="left",
+        ).pack(anchor="w", pady=(8, 12))
+        fw_status = tk.StringVar(master=wizard, value="Checking…")
+        ttk.Label(page2, textvariable=fw_status).pack(anchor="w")
+        allow_button = ttk.Button(page2, text="Allow network access")
+        allow_button.pack(anchor="w", pady=8)
+
+        def on_fw_state(state):
+            try:
+                if not wizard.winfo_exists():
+                    return
+            except tk.TclError:
+                return
+            if state.get("ok"):
+                fw_status.set("✅ Connections are allowed.")
+                allow_button.state(["disabled"])
+            else:
+                fw_status.set("❌ Not allowed yet.")
+                allow_button.state(["!disabled"])
+
+        def refresh_firewall():
+            fw_status.set("Checking…")
+            self._check_firewall_async(then=on_fw_state)
+
+        allow_button.configure(command=lambda: self.allow_network_access(then=on_fw_state))
+        nav2 = ttk.Frame(page2)
+        nav2.pack(side="bottom", fill="x")
+        ttk.Button(nav2, text="← Back", command=lambda: show(0)).pack(side="left")
+        ttk.Button(nav2, text="Next →", command=lambda: show(2)).pack(side="right")
+        pages.append(page2)
+
+        # Page 3: create or join
+        page3 = ttk.Frame(container)
+        ttk.Label(page3, text="Step 3 of 3 — Create or join a network", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+        ttk.Label(page3, text="Start your own network, or join one that someone near you has created.", wraplength=460).pack(anchor="w", pady=(8, 12))
+        create_var = tk.StringVar(master=wizard, value="")
+        create_row = ttk.Frame(page3)
+        create_row.pack(fill="x", pady=4)
+        ttk.Entry(create_row, textvariable=create_var, width=26).pack(side="left")
+
+        def do_create():
+            name = create_var.get().strip()
+            if not name:
+                messagebox.showerror("Create Network", "Type a name for your network first.", parent=wizard)
+                return
+            if name in self.networks:
+                messagebox.showerror("Create Network", f"You already have a network called '{name}'.", parent=wizard)
+                return
+            if not self.node:
+                self.start_node()
+            self._create_network(name, "private", "seed", 1, "", [], True)
+            finish()
+            messagebox.showinfo(
+                "Network Created",
+                f"'{name}' is ready.\n\nPeople near you can now find it under 'Networks Nearby' and ask to join. "
+                "You will be asked to approve each person.",
+            )
+
+        ttk.Button(create_row, text="Create my network", command=do_create).pack(side="left", padx=8)
+        ttk.Button(page3, text="Join a network nearby…", command=lambda: (finish(), self.show_nearby_networks())).pack(anchor="w", pady=(14, 4))
+        ttk.Button(page3, text="I have an invite file (.mdar)…", command=lambda: (finish(), self.join_network_dialog())).pack(anchor="w", pady=4)
+        nav3 = ttk.Frame(page3)
+        nav3.pack(side="bottom", fill="x")
+        ttk.Button(nav3, text="← Back", command=lambda: show(1 if mda_firewall.is_supported() else 0)).pack(side="left")
+        ttk.Button(nav3, text="Skip for now", command=finish).pack(side="right")
+        pages.append(page3)
+
+        show(0)
+        name_entry.focus_set()
+
     def show_help(self):
         messagebox.showinfo(
             "Help",
-            "Use the menu bar for all actions:\n\n"
-            "Contacts: add/edit/delete/list contacts.\n"
-            "Network: create/edit/join/delete/import/export/list networks.\n"
-            "Node: start/stop node and edit node settings.\n"
-            "About: this help and about information.\n\n"
+            "Getting started:\n"
+            "1. Setup Wizard: choose your name and allow network access.\n"
+            "2. Create a network, or open 'Networks Nearby' and click Join.\n"
+            "3. The network owner approves you; members then appear in Contacts.\n\n"
+            "Something not working? Click 'Test Connection'. It checks both directions\n"
+            "and tells you what to fix.\n\n"
+            "Not on the same Wi-Fi? Use Network > Join by Address, or a .mdar invite file.\n\n"
             "Tip: double-click a contact to open its chat window.",
         )
 
@@ -2397,7 +3327,7 @@ def run_cli_mode(args):
 
 def main():
     parser = argparse.ArgumentParser(description="MDA chat client")
-    parser.add_argument("--host", default=mda.get_local_ip(), help="Local bind host for this node")
+    parser.add_argument("--host", default=None, help="Address to announce (default: detect automatically)")
     parser.add_argument("--port", type=int, default=50404, help="Local port to bind the node")
     parser.add_argument("--peer", action="append", default=[], help="Peer endpoint host:port")
     parser.add_argument("--message", default="", help="Message to send to peers")
@@ -2405,13 +3335,17 @@ def main():
     args = parser.parse_args()
 
     if args.cli or args.message:
+        args.host = args.host or mda.get_local_ip()
         run_cli_mode(args)
         return
 
     root = tk.Tk()
     app = MDAClientGUI(root)
-    app.host_var.set(args.host)
-    app.port_var.set(str(args.port))
+    if args.host:
+        app.host_mode = "manual"
+        app.host_var.set(args.host)
+    if args.port != 50404 or not app.port_var.get().strip():
+        app.port_var.set(str(args.port))
     active_network = app._active_network_name()
     for peer in args.peer:
         app._upsert_contact(endpoint=peer, nickname=f"Peer-{peer.rsplit(':', 1)[-1] if ':' in peer else peer}", network=active_network)

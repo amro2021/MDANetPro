@@ -25,8 +25,48 @@ MDANetPro is a lightweight peer-to-peer networking/chat prototype built in Pytho
      ```
 3. Install dependencies:
    ```bash
-   pip install pycryptodome
+   pip install pycryptodome peewee psutil   # psutil is optional
    ```
+
+## Quick start (no technical setup)
+
+1. Open **MDANetClient**. A 3-step **Setup Wizard** appears on first run:
+   1. Type your name (what others will see).
+   2. Click **Allow network access** and answer *Yes* on the Windows prompt (once per computer).
+      The installer does this for you, so installed copies skip this step.
+   3. **Create my network**, or **Join a network nearby**.
+2. To join, open **Networks Nearby**, select the network, and click **Join**. The owner gets an approval popup;
+   once approved, you get a "You joined" message and the members appear in your contacts.
+3. If something doesn't work, click **Test Connection**. It checks both directions with every member and says,
+   in plain words, what to fix (firewall, wrong address, other computer off). It also offers a one-click fix.
+
+What happens automatically:
+- **Address:** the node listens on all network adapters and picks the right IP itself (Node > Node Settings,
+  Address = `auto`). If you move from Wi-Fi to a cable, it notices and tells your networks the new address
+  (signed with your key), so nobody has to re-export a `.mdar`.
+- **Identity:** nodes are recognised by their public key, so a node that changes IP is updated, not duplicated,
+  and two people can use the same name.
+- **Discovery:** seed/trusted nodes announce their networks on the local network (UDP 50405). You can turn this
+  off per network ("Show in 'Networks Nearby'" when creating a network).
+
+Not on the same Wi-Fi, or discovery blocked? Use **Network > Join by Address** (type the owner's IP) or a `.mdar` invite file.
+
+### Ports
+| Port | Protocol | Use |
+|---|---|---|
+| 50404 | TCP | node connections (messages, joins, connection test) |
+| 50405 | UDP | Networks Nearby announcements |
+
+### Building the Windows installer
+1. `pip install pyinstaller pycryptodome peewee psutil` (`psutil` is optional; it improves adapter detection)
+2. `pyinstaller MDANetClient.spec` builds `dist\MDANetClient.exe`
+3. Compile `installer\MDANetPro.iss` with [Inno Setup](https://jrsoftware.org/isinfo.php) to get `installer\Output\MDANetPro-Setup.exe`.
+   The installer adds the firewall rules. App data is stored in `%LOCALAPPDATA%\MDANetPro`. A copy that already has
+   data next to it keeps using that folder.
+
+### Tests
+`python tests/e2e_easy_setup.py` and `python tests/e2e_failure_paths.py` run real nodes on this computer
+(close MDANetPro first; they use ports 50404–50434).
 
 ## How to Use
 
