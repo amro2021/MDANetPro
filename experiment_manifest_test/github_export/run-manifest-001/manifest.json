@@ -1,0 +1,91 @@
+{
+  "collector": {
+    "host": "127.0.0.1",
+    "port": 9092
+  },
+  "controls": {
+    "config_hash": "11ae19021185ff9d9ab55e48c67ec15a1f47dc663c5364d6b49dbf33c022d14b",
+    "random_seed": 0,
+    "run_hash": "c244578b8ba50d59f3d55ad989c4616f9b3b4dcacf3f9b43a138cf028e410132"
+  },
+  "created_at": 1792701532.3092916,
+  "end_time": null,
+  "environment": {
+    "cpu_cores": 0,
+    "lab_name": "",
+    "machines": [],
+    "memory_gb": 0,
+    "platform": "windows",
+    "python_version": ""
+  },
+  "experiment_id": "manifest-smoke",
+  "experiment_name": "manifest-smoke-run",
+  "export_dir": "experiment_manifest_test\\github_export\\run-manifest-001",
+  "logging": {
+    "anonymization_level": "pseudonymized",
+    "batch_interval_sec": 30,
+    "collector_url": "http://127.0.0.1:9092",
+    "log_levels": [
+      "event",
+      "packet",
+      "control",
+      "security"
+    ],
+    "retention_days": 30,
+    "share_mode": "opt_in"
+  },
+  "metadata": {
+    "analysis_scripts": [],
+    "contact_email": "",
+    "experiment_notes": "manifest validation test",
+    "github_repository": "",
+    "lab_name": "",
+    "network_name": "lab_net",
+    "notes": "manifest validation test",
+    "software_commit": ""
+  },
+  "network": {
+    "join_policy": "manual_approval",
+    "member_count": 3,
+    "network_id": "lab_net",
+    "network_rules": {},
+    "relay_count": 2,
+    "seed_nodes": [
+      "node-01:50404"
+    ],
+    "topology": "mesh",
+    "trusted_nodes": [
+      "node-01:50404"
+    ]
+  },
+  "prepared_at": 1792701536.7627578,
+  "run_id": "run-manifest-001",
+  "schema_version": "mda_manifest_v1",
+  "start_time": 1792701532.3092916,
+  "study_type": "performance",
+  "traffic": {
+    "circuit_max_uses": 8,
+    "circuit_ttl_sec": 120,
+    "control_message_interval_sec": 30,
+    "cover_traffic_enabled": true,
+    "message_size_bytes": 768,
+    "onion_hops": 2,
+    "payload_padding": true,
+    "real_to_fake_ratio": 1.0,
+    "slot_interval_sec": 2
+  },
+  "workload": {
+    "duration_sec": 600,
+    "failure_model": {
+      "churn_schedule": [],
+      "jitter_ms": 0,
+      "node_churn": false,
+      "packet_loss_pct": 0
+    },
+    "message_count_target": 0,
+    "message_pattern": "steady_state",
+    "receivers": [],
+    "security_tests": [],
+    "senders": []
+  }
+}

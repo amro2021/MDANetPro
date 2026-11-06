@@ -5,3 +5,10 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# Local GUI runtime state
+mdaclient_state.json
+
+# Local encrypted client storage
+mda_client_local.db
+.mda_local_key.bin
