@@ -112,23 +112,21 @@ print("---- connection test output ----\n" + out.strip() + "\n------------------
 check("connection test: connected both ways", "connected both ways" in out)
 win.destroy()
 
-# --- Address change on A -> B follows
+# --- IP change on A: its key-based address stays the same, so nothing needs renaming
 old_a = A.node.nodeid
 A._change_address("127.0.0.1", reason="test")
-moved = pump(4, until=lambda: any(c["nickname"] == "Amr" and c["endpoint"] == "127.0.0.1:50404" for c in B.contacts))
-check("B updated A's contact to new address", moved)
-b_node_entry = [e for e in B.networks["Said Shabaka"]["nodes"].values() if isinstance(e, dict) and e.get("nickname") == "Amr"]
-check("B updated A's node entry (by public key)", b_node_entry and b_node_entry[0]["endpoint"] == "127.0.0.1:50404")
-check("no duplicate Amr entries on B", len(b_node_entry) == 1)
+check("A keeps the same network address after an IP change", A.node.nodeid == old_a and A.node.host == "127.0.0.1")
+pump(2)
+amr = [e for e in B.networks["Said Shabaka"]["nodes"].values() if isinstance(e, dict) and e.get("nickname") == "Amr"]
+check("B still has exactly one Amr entry at the same address", len(amr) == 1 and amr[0]["endpoint"] == old_a)
 A.send_to_peer(B.node.nodeid, "second message after move")
 got2 = pump(12, until=lambda: any("second message after move" in w.log.get("1.0", "end") for w in B.chat_windows.values()))
 check("chat still works after A moved", got2)
 
 # --- watcher: 127.0.0.1 is not a real adapter, A should move back automatically
-back = pump(9, until=lambda: A.node.nodeid == old_a)
+back = pump(9, until=lambda: A.node.host != "127.0.0.1")
 check("address watcher moved A back to a real adapter", back)
-back_b = pump(6, until=lambda: any(c["nickname"] == "Amr" and c["endpoint"] == old_a for c in B.contacts))
-check("B followed A back", back_b)
+check("B's contact for Amr unchanged", any(c["nickname"] == "Amr" and c["endpoint"] == old_a for c in B.contacts))
 
 # --- Third node joins by address (hello lookup)
 C = make("Zed", 50424)
@@ -137,6 +135,7 @@ C.setup_done = True
 if C._wizard: C._wizard.destroy()
 C.node_name_var.set("Zed")
 reply = C.node.hello(f"{A.node.host}:50404")
+check("hello reply carries A's signed route record", reply and reply.get("record", {}).get("node") == A.node.nodeid)
 check("hello lists A's network", reply and [n["network"] for n in reply["networks"]] == ["Said Shabaka"])
 C._finish_join_by_address(f"{A.node.host}:50404", reply, "")
 joinedC = pump(10, until=lambda: C.networks.get("Said Shabaka", {}).get("membership_status") == "active")

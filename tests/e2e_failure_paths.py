@@ -67,16 +67,15 @@ out = run_test(B)
 check("test: one-way -> 'can't reach you back'", "can't reach you back" in out)
 B.stop_node(); pump(0.3)
 
-# 3. B restarts on a different address (manual 127.0.0.1) -> A follows, no duplicate
-old_b = f"{B.host_var.get()}:50414"
+# 3. B restarts on a different IP (manual 127.0.0.1): same key-based address, A keeps one entry
+old_b = B._local_endpoint()
 B.host_mode = "manual"; B.host_var.set("127.0.0.1")
 B.start_node()
-check("B restarted at 127.0.0.1", B.node.nodeid == "127.0.0.1:50414")
-ok = pump(8, until=lambda: any(c["endpoint"] == "127.0.0.1:50414" for c in A.contacts))
-check("A updated Nano's address after B restarted", ok)
+check("B restarted with the same network address", B.node.nodeid == old_b and B.node.host == "127.0.0.1")
+pump(3)
 nano = [e for e in A.networks["Lab"]["nodes"].values() if isinstance(e, dict) and e.get("nickname") == "Nano"]
-check("A has exactly one Nano entry", len(nano) == 1 and nano[0]["endpoint"] == "127.0.0.1:50414")
-check("Nano contact name preserved", any(c["nickname"] == "Nano" and c["endpoint"] == "127.0.0.1:50414" for c in A.contacts))
+check("A has exactly one Nano entry", len(nano) == 1 and nano[0]["endpoint"] == old_b)
+check("Nano contact name preserved", any(c["nickname"] == "Nano" and c["endpoint"] == old_b for c in A.contacts))
 out = run_test(B)
 check("test after restart: connected both ways", "connected both ways" in out)
 
@@ -84,7 +83,7 @@ check("test after restart: connected both ways", "connected both ways" in out)
 from Crypto.PublicKey import RSA
 stranger = RSA.generate(2048)
 pk = stranger.publickey().export_key().decode()
-fake = {"type": "control", "action": "address_update", "network": "", "old_endpoint": "127.0.0.1:50414",
+fake = {"type": "control", "action": "address_update", "network": "", "old_endpoint": B._local_endpoint(),
         "new_endpoint": "6.6.6.6:50414", "pubkey": pk, "time": time.time(), "signature": "AAAA", "sender": "6.6.6.6:50414"}
 A.node.send_control_message(A.node.nodeid, fake); pump(1)
 real_pub = B.identity["public_key_pem"]
@@ -111,7 +110,7 @@ check("A keeps both Nanos as separate nodes", len([n for n in names if n.startsw
 check("state saved in data dir", os.path.exists(os.path.join(A._dir, "mdaclient_state.json")))
 check("firewall helper reports not needed on Linux", mda_firewall.check_firewall()["ok"] and not mda_firewall.is_supported())
 s = mda_firewall.build_allow_script(50404, 50405, r"C:\Program Files\MDANetPro\MDANetClient.exe")
-check("allow script has TCP/UDP/ICMP + block-rule cleanup", all(x in s for x in ("-LocalPort 50404", "-LocalPort 50405", "ICMPv4", "Action -eq 'Block'", "MDANetClient.exe")))
+check("allow script has TCP/UDP/ICMP + block-rule cleanup", all(x in s for x in ("-Protocol TCP -LocalPort 50404", "-Protocol UDP -LocalPort 50404,50405", "ICMPv4", "Action -eq 'Block'", "MDANetClient.exe")))
 s2 = mda_firewall.build_allow_script(50404, 50405, r"C:\Users\O'Brien\app.exe")
 check("PowerShell quoting of paths with apostrophes", "'C:\\Users\\O''Brien\\app.exe'" in s2)
 

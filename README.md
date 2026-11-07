@@ -55,6 +55,7 @@ Not on the same Wi-Fi, or discovery blocked? Use **Network > Join by Address** (
 | Port | Protocol | Use |
 |---|---|---|
 | 50404 | TCP | node connections (messages, joins, connection test) |
+| 50404 | UDP | hole punching between members on different networks |
 | 50405 | UDP | Networks Nearby announcements |
 
 ### Building the Windows installer
@@ -67,6 +68,40 @@ Not on the same Wi-Fi, or discovery blocked? Use **Network > Join by Address** (
 ### Tests
 `python tests/e2e_easy_setup.py` and `python tests/e2e_failure_paths.py` run real nodes on this computer
 (close MDANetPro first; they use ports 50404–50434).
+
+## Connecting across different networks (internet, peer-to-peer)
+
+Members don't have to be on the same Wi-Fi. There is no central server: nodes talk directly, and
+other members help only when a direct path is impossible.
+
+**Addresses.** Each node's address is derived from its key, e.g. `3f9a0c2e5b7d11aa8c42.mda:50404`, so it
+stays the same when the IP changes and can't be impersonated. Each node publishes a *signed route record*
+with every way to reach it right now. Records travel with join requests, member lists, `.mdar` files and
+updates.
+
+**How a connection is made**, tried in this order:
+1. **Same network**: the LAN address, when both are behind the same router.
+2. **IPv6**: direct, when both sides have a global IPv6 address.
+3. **Public port**: opened automatically on the home router with **UPnP / NAT-PMP**, or a manual
+   port-forward (Node > Node Settings > *Public address*).
+4. **UDP hole punching**: both sides learn their public address from STUN servers and "punch" through
+   their NATs at the same time (introduced by a member they're both connected to).
+5. **Relay through a member**: a node behind NAT keeps a connection open to one or two reachable members
+   (seed/trusted first). Only members and pending joiners may use a relay. Messages stay end-to-end
+   encrypted (onion layers), so the relay can't read them.
+
+**What's needed:** at least one member who is reachable from the internet, usually the network owner,
+with a router that allows UPnP or has a port-forward for TCP+UDP 50404. Others can then join from anywhere
+with **Join by Address** (type the owner's public IP) or a `.mdar` file. The status bar and **Test Connection**
+show how each member is reached ("direct (internet)", "direct (UDP hole punch)", "via relay …").
+
+Mobile data and many university networks use symmetric/carrier NAT: hole punching won't work there, and
+those members are reached through a relay automatically.
+
+STUN servers default to public ones (Google, Cloudflare). Set `MDANET_STUN_SERVERS=host:port,host:port`
+to use your own (`python -c "import mda_stun,time; mda_stun.StunServer(); time.sleep(1e9)"` runs one).
+
+Tests: `tests/test_p2p_units.py`, and the simulated-internet tests in `tests/netsim/` (Linux, root).
 
 ## How to Use
 

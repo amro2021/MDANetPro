@@ -3,7 +3,7 @@
 check_firewall() reads the current rules (no admin needed).
 allow_network_access() shows the normal Windows admin prompt once and adds the rules:
   - inbound TCP on the node port (default 50404)
-  - inbound UDP on the discovery port (default 50405)
+  - inbound UDP on the node port (hole punching) and the discovery port (default 50405)
   - inbound ping (ICMPv4 echo), so connection tests give clear answers
 It also removes inbound *Block* rules that Windows creates for this program when the
 user clicks Cancel on the first-run firewall popup (a Block rule beats any Allow rule).
@@ -47,7 +47,7 @@ $tcp = $false; $udp = $false
 foreach ($r in $own) {{
   $pf = $r | Get-NetFirewallPortFilter
   if ($pf.Protocol -eq 'TCP' -and ($pf.LocalPort -contains '{int(tcp_port)}')) {{ $tcp = $true }}
-  if ($pf.Protocol -eq 'UDP' -and ($pf.LocalPort -contains '{int(udp_port)}')) {{ $udp = $true }}
+  if ($pf.Protocol -eq 'UDP' -and ($pf.LocalPort -contains '{int(udp_port)}') -and ($pf.LocalPort -contains '{int(tcp_port)}')) {{ $udp = $true }}
 }}
 $blocked = @(Get-NetFirewallApplicationFilter -Program {_ps_quote(program)} | Get-NetFirewallRule | Where-Object {{ $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' }}).Count
 $profiles = @(Get-NetFirewallProfile | Where-Object {{ $_.Enabled -eq 'True' }}).Count
@@ -61,7 +61,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 Get-NetFirewallApplicationFilter -Program {_ps_quote(program)} | Get-NetFirewallRule | Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' }} | Remove-NetFirewallRule
 Remove-NetFirewallRule -DisplayName '{RULE_PREFIX}*'
 New-NetFirewallRule -DisplayName '{RULE_PREFIX} node (TCP {int(tcp_port)})' -Direction Inbound -Protocol TCP -LocalPort {int(tcp_port)} -Action Allow -Profile Any | Out-Null
-New-NetFirewallRule -DisplayName '{RULE_PREFIX} discovery (UDP {int(udp_port)})' -Direction Inbound -Protocol UDP -LocalPort {int(udp_port)} -Action Allow -Profile Any | Out-Null
+New-NetFirewallRule -DisplayName '{RULE_PREFIX} p2p + discovery (UDP {int(tcp_port)},{int(udp_port)})' -Direction Inbound -Protocol UDP -LocalPort {int(tcp_port)},{int(udp_port)} -Action Allow -Profile Any | Out-Null
 New-NetFirewallRule -DisplayName '{RULE_PREFIX} ping' -Direction Inbound -Protocol ICMPv4 -IcmpType 8 -Action Allow -Profile Any | Out-Null
 """
 

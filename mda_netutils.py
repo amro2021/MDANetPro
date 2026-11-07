@@ -6,6 +6,8 @@ better interface names and real netmasks.
 """
 import ipaddress
 import socket
+import threading
+import time
 
 try:  # optional
     import psutil  # type: ignore
@@ -35,8 +37,41 @@ def local_ip_for(target_host, port=80):
     return ip if _is_usable(ip) else ""
 
 
+_CACHE = {"time": 0.0, "value": []}
+_CACHE_TTL = 15.0
+
+
+def _hostname_ipv4(timeout=1.0):
+    """getaddrinfo(hostname) can hang for seconds when DNS is broken: never wait long."""
+    box = []
+
+    def lookup():
+        try:
+            box.extend(info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET))
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=lookup, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return list(box)
+
+
 def _interfaces():
-    """List of (name, ip, netmask) for IPv4 interfaces that are up."""
+    """List of (name, ip, netmask) for IPv4 interfaces that are up (cached for a few seconds)."""
+    now = time.time()
+    if now - _CACHE["time"] < _CACHE_TTL:
+        return list(_CACHE["value"])
+    value = _interfaces_uncached()
+    _CACHE["time"], _CACHE["value"] = now, value
+    return list(value)
+
+
+def invalidate_cache():
+    _CACHE["time"] = 0.0
+
+
+def _interfaces_uncached():
     result = []
     if psutil is not None:
         try:
@@ -52,14 +87,10 @@ def _interfaces():
     if result:
         return result
     seen = set()
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if _is_usable(ip) and ip not in seen:
-                seen.add(ip)
-                result.append(("", ip, ""))
-    except OSError:
-        pass
+    for ip in [local_ip_for("8.8.8.8")] + _hostname_ipv4():
+        if ip and _is_usable(ip) and ip not in seen:
+            seen.add(ip)
+            result.append(("", ip, ""))
     return result
 
 

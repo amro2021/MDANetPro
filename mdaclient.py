@@ -23,6 +23,8 @@ from Crypto.Signature import pss
 import mda_firewall
 from client_storage import ClientStorage
 from mda_discovery import DISCOVERY_PORT, LanDiscovery
+import mda_netutils
+import mda_p2p
 from mda_netutils import best_local_ip, candidate_ips, local_ip_for
 from mdanetwork import mda
 from net_profile import export_mdar_file, import_mdar_file
@@ -147,6 +149,12 @@ class MDAClientGUI:
         self.node_name_var = tk.StringVar(value=default_node_name())
         self.node_description_var = tk.StringVar(value="")
         self.host_mode = "auto"  # "auto": pick and follow the right IP; "manual": use host_var as typed
+        self.use_upnp = True  # ask the home router to open the port automatically
+        self.public_address = ""  # optional "ip-or-name[:port]" of a manual router port-forward
+        self._recent_join_requesters = {}  # pubkey -> time (allowed to use us as relay while pending)
+        self._routes_broadcast_pending = False
+        self._nat_check_running = False
+        self._last_nat_check = 0.0
         self.host_var = tk.StringVar(value=best_local_ip())
         self.port_var = tk.StringVar(value="50404")
         self.peer_entry_var = tk.StringVar(value="")
@@ -181,6 +189,7 @@ class MDAClientGUI:
         self.root.after(400, self._auto_start_node)
         self.root.after(self.traffic_interval_ms, self._traffic_tick)
         self.root.after(5000, self._address_watch_tick)
+        self.root.after(4000, self._p2p_tick)
         self.root.after(1000, self._announce_tick)
         if self.first_run or not self.setup_done:
             self.root.after(700, self.setup_wizard)
@@ -385,6 +394,8 @@ class MDAClientGUI:
             self.host_var.set(str(node_data.get("host", self.host_var.get())))
         # In auto mode the saved host is ignored: the address is re-detected every start.
         self.port_var.set(str(node_data.get("port", self.port_var.get())))
+        self.use_upnp = bool(node_data.get("use_upnp", True))
+        self.public_address = str(node_data.get("public_address", "")).strip()
         self.setup_done = bool(payload.get("setup_done", True))
         self.active_network_var.set(str(payload.get("active_network", self.active_network_var.get())))
 
@@ -471,6 +482,8 @@ class MDAClientGUI:
                 "description": self.node_description_var.get().strip(),
                 "host": self.host_var.get().strip(),
                 "host_mode": self.host_mode,
+                "use_upnp": bool(self.use_upnp),
+                "public_address": self.public_address,
                 "port": self.port_var.get().strip(),
             },
             "setup_done": bool(self.setup_done),
@@ -672,9 +685,12 @@ class MDAClientGUI:
     def _update_status(self):
         active_network = self._active_network_name()
         if self.node:
-            mode = "auto" if self.host_mode == "auto" else "manual"
+            reach = self.node.transport.connectivity_summary() if self.node.transport else ""
+            if self._nat_check_running and not self._last_nat_check:
+                reach = "checking internet connectivity…"
             self.node_status_var.set(
-                f"Running as {self.node.nodeid} ({mode} address) | Name: {self.node_name_var.get().strip() or 'node'} | Active network: {active_network}"
+                f"Running ({self.node.host}) | Name: {self.node_name_var.get().strip() or 'node'} | "
+                f"Network: {active_network} | Internet: {reach}"
             )
         else:
             self.node_status_var.set(f"Stopped | Active network: {active_network}")
@@ -837,7 +853,11 @@ class MDAClientGUI:
     def _local_endpoint(self):
         if self.node and self.node.nodeid:
             return self.node.nodeid
-        return f"{self.host_var.get().strip()}:{self.port_var.get().strip()}"
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            port = mda.PORT
+        return mda_p2p.node_address(self.identity.get("public_key_pem", ""), port)
 
     def _handle_control_packet(self, packet):
         action = str(packet.get("action", "")).strip().lower()
@@ -857,6 +877,9 @@ class MDAClientGUI:
             return
         if action == "address_update":
             self._handle_address_update(packet)
+            return
+        if action == "routes_update":
+            self._handle_routes_update(packet)
             return
         if action in ("join_approved", "node_list_update"):
             self._handle_signed_update_packet(packet, network_name, action, mark_active=(action == "join_approved"))
@@ -1382,6 +1405,9 @@ class MDAClientGUI:
                 bind_host="0.0.0.0",
             )
             self.node.hello_provider = self._hello_networks
+            self.node.transport.relay_policy = self._relay_allowed
+            self.node.transport.manual_public = self.public_address
+            self.node.transport.on_record_changed = lambda record: self.ui_calls.put(lambda: self._on_local_record_changed(record))
             self.node.start_server()
         except OSError as exc:
             self.node = None
@@ -1395,9 +1421,11 @@ class MDAClientGUI:
                 messagebox.showerror("Start Failed", str(exc))
             return
         old_endpoints = self._upsert_local_node_in_networks()
+        self._load_records_into_transport()
         self._refresh_hello_cache()
         self._sync_node_peers_for_active_network()
         self._start_discovery()
+        self._start_nat_check()
         self._update_status()
         self._log(f"Node started on {self.node.nodeid}")
         self._save_state()
@@ -1431,6 +1459,8 @@ class MDAClientGUI:
                 {"name": "name", "label": "Node name", "initial": self.node_name_var.get()},
                 {"name": "description", "label": "Node description", "initial": self.node_description_var.get()},
                 {"name": "host", "label": "Address (\"auto\" = detect automatically)", "initial": "auto" if self.host_mode == "auto" else self.host_var.get()},
+                {"name": "use_upnp", "label": "Open router port automatically (UPnP)", "initial": "yes" if self.use_upnp else "no", "kind": "combobox", "options": ["yes", "no"]},
+                {"name": "public_address", "label": "Public address of a router port-forward (optional)", "initial": self.public_address},
                 {"name": "port", "label": "Port", "initial": self.port_var.get()},
             ],
             submit_label="Save Settings",
@@ -1441,6 +1471,14 @@ class MDAClientGUI:
         description = values.get("description", "")
         host = values.get("host", "")
         port_text = values.get("port", "")
+        use_upnp = str(values.get("use_upnp", "yes")).strip().lower() != "no"
+        public_address = str(values.get("public_address", "")).strip()
+        nat_changed = use_upnp != self.use_upnp or public_address != self.public_address
+        self.use_upnp, self.public_address = use_upnp, public_address
+        if self.node and self.node.transport:
+            self.node.transport.manual_public = public_address
+            if nat_changed:
+                self._start_nat_check()
         try:
             int(port_text.strip())
         except ValueError:
@@ -1667,8 +1705,9 @@ class MDAClientGUI:
         return {
             "network_type": network_info.get("type", "private"),
             "network_description": network_info.get("description", ""),
-            "network_rules": network_info.get("rules", []),
-            "nodes": network_info.get("nodes", {}),
+            "network_rules": list(network_info.get("rules", [])),
+            # A copy: the live node list keeps changing (route records) after this is hashed.
+            "nodes": json.loads(json.dumps(network_info.get("nodes", {}))),
             "min_approvals": min_approvals,
         }
 
@@ -1806,6 +1845,7 @@ class MDAClientGUI:
             "description": self.node_description_var.get().strip(),
             "requested_role": self.networks.get(network_name, {}).get("my_role", "member"),
             "public_key": self.node.get_public_key_pem() if self.node else self.identity.get("public_key_pem", ""),
+            "record": self.node.transport.local_record if self.node.transport else None,
             "time": time.time(),
         }
 
@@ -1835,6 +1875,8 @@ class MDAClientGUI:
             except (OSError, ValueError) as exc:
                 self._log(f"Join request failed to {endpoint}: {exc}")
 
+        if sent_count:
+            self._choose_relays()  # behind NAT: keep a line open so the approval can reach us
         if sent_count == 0:
             if messagebox.askyesno(
                 "Join Network",
@@ -1860,6 +1902,38 @@ class MDAClientGUI:
             self._log(f"Control message failed to {endpoint}: {exc}")
             return False
 
+    def _send_control_reliable(self, endpoint, payload, within=180, label=""):
+        """Deliver an important control message in the background, retrying until it gets through.
+
+        A member behind NAT may not be reachable for a few seconds (e.g. right after its join
+        request, before its relay connection is up). Duplicates are harmless: updates are
+        identified by update_id and applied once.
+        """
+        if not self.node:
+            return
+        node = self.node
+        label = label or str(payload.get("action", "message"))
+        # Freeze the message now: signed update bodies must not change while we retry.
+        payload = json.loads(json.dumps(payload))
+
+        def worker():
+            deadline = time.time() + within
+            attempt = 0
+            last_error = ""
+            while time.time() < deadline and self.node is node:
+                attempt += 1
+                try:
+                    node.send_control_message(endpoint, payload, timeout=6)
+                    if attempt > 1:
+                        self.ui_calls.put(lambda: self._log(f"{label} delivered to {self._nickname_for_endpoint(endpoint) or endpoint} (attempt {attempt})."))
+                    return
+                except (OSError, ValueError) as exc:
+                    last_error = str(exc)
+                    time.sleep(min(3 * attempt, 15))
+            self.ui_calls.put(lambda: self._log(f"Could not deliver {label} to {endpoint}: {last_error}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _broadcast_update_vote(self, network_name, action, update_id, update_hash, update_body, vote):
         payload = {
             "type": "control",
@@ -1877,7 +1951,7 @@ class MDAClientGUI:
         for endpoint in self._network_endpoints(network_name):
             if endpoint == self._local_endpoint():
                 continue
-            self._send_control_message(endpoint, payload)
+            self._send_control_reliable(endpoint, payload, label=action)
 
     def _apply_network_update(self, packet, network_name, mark_active=False):
         if not network_name:
@@ -1907,6 +1981,7 @@ class MDAClientGUI:
             merged_nodes.update({key: (dict(value) if isinstance(value, dict) else value) for key, value in existing_nodes.items()})
         incoming_nodes = packet.get("nodes", {})
         if isinstance(incoming_nodes, dict):
+            self._learn_records_from_nodes(incoming_nodes)
             for node_key, node_entry in incoming_nodes.items():
                 previous = []
                 self._put_node_entry(merged_nodes, node_key, node_entry, previous_endpoints=previous)
@@ -1956,6 +2031,8 @@ class MDAClientGUI:
         self._refresh_hello_cache()
         self._log(f"Network '{network_name}' synchronized ({added} contacts refreshed).")
         if mark_active and was_pending:
+            self._choose_relays()
+            self.root.after(500, self._broadcast_routes)  # let the other members learn how to reach us
             if self._nearby_window is not None:
                 self._render_nearby()
             messagebox.showinfo("Joined", f"You joined '{network_name}'.\n\nThe members now appear in your contacts.")
@@ -2005,13 +2082,24 @@ class MDAClientGUI:
         if requested_role in ("trusted", "seed") and my_role != "seed":
             requested_role = "member"
         requester_pubkey = str(packet.get("public_key", "")).strip()
+        if requester_pubkey:
+            self._recent_join_requesters[requester_pubkey] = time.time()
+        requester_record = packet.get("record") if isinstance(packet.get("record"), dict) else None
+        if requester_record and self.node and self.node.transport:
+            if not (mda_p2p.verify_record(requester_record) and self._same_pubkey(requester_record.get("pubkey"), requester_pubkey)):
+                requester_record = None
+            else:
+                self.node.transport.learn_record(requester_record)
         previous = []
-        self._put_node_entry(nodes, requester_name, {
+        entry = {
             "endpoint": sender_endpoint,
             "role": requested_role,
             "nickname": requester_name,
             "pubkey": requester_pubkey,
-        }, previous_endpoints=previous)
+        }
+        if requester_record:
+            entry["record"] = requester_record
+        self._put_node_entry(nodes, requester_name, entry, previous_endpoints=previous)
         for old_endpoint in previous:
             self._rename_endpoint(old_endpoint, sender_endpoint)
         network_info["nodes"] = nodes
@@ -2041,7 +2129,7 @@ class MDAClientGUI:
             "sender": self._local_endpoint(),
             "time": time.time(),
         }
-        self._send_control_message(sender_endpoint, join_payload)
+        self._send_control_reliable(sender_endpoint, join_payload, label="join approval")
 
         self._broadcast_update_vote(
             network_name=network_name,
@@ -2238,6 +2326,7 @@ class MDAClientGUI:
     def _join_network(self, name, net_type, description, rules, nodes, my_role="member", min_approvals=2):
         """Store a pending membership for `name` and ask its seed/trusted nodes to let us in."""
         nodes = {key: (dict(value) if isinstance(value, dict) else value) for key, value in (nodes or {}).items()}
+        self._learn_records_from_nodes(nodes)
         join_targets = self._collect_join_targets(nodes)
         network_entry = self.networks.get(name, {"nodes": {}})
         network_entry["type"] = net_type
@@ -2278,6 +2367,8 @@ class MDAClientGUI:
             return
         local_ips = candidate_ips()
         for endpoint in endpoints or []:
+            if mda_p2p.is_virtual(endpoint):
+                continue  # key-based address: routing picks the adapter itself
             try:
                 host, _port = parse_peer(endpoint)
             except (ValueError, AttributeError):
@@ -2418,6 +2509,9 @@ class MDAClientGUI:
                     "nickname": nickname,
                     "pubkey": pubkey,
                 }
+                record = self._record_for_endpoint(endpoint)
+                if record:
+                    selected_by_endpoint[endpoint]["record"] = record
                 return
             if role_rank.get(role, 0) > role_rank.get(existing.get("role", "member"), 0):
                 existing["role"] = role
@@ -2609,6 +2703,7 @@ class MDAClientGUI:
                 "time": timestamp,
                 "signature": base64.b64encode(pss.new(private_key).sign(digest)).decode("ascii"),
                 "sender": new_endpoint,
+                "record": self.node.transport.local_record if self.node.transport else None,
             })
         if not payloads:
             return
@@ -2649,6 +2744,8 @@ class MDAClientGUI:
         if abs(time.time() - timestamp) > 24 * 3600:
             self._log(f"Ignored stale address update for {old_endpoint}.")
             return
+        if isinstance(packet.get("record"), dict) and self.node and self.node.transport:
+            self.node.transport.learn_record(packet["record"])
         previous = set()
         nickname = ""
         for network_info in self.networks.values():
@@ -2706,6 +2803,8 @@ class MDAClientGUI:
             "role": str(info.get("my_role", "member")),
             "nickname": self.node_name_var.get().strip() or "node",
             "pubkey": local_pubkey,
+            "port": self.node.port if self.node else self._node_port(),
+            "record": self.node.transport.local_record if (self.node and self.node.transport) else None,
         }
 
     def _refresh_hello_cache(self):
@@ -2732,7 +2831,10 @@ class MDAClientGUI:
     def _announce_tick(self):
         try:
             if self.node and self.discovery is not None:
-                announcements = [LanDiscovery.build_announcement(item["network"], item) for item in self._hello_networks()]
+                announcements = [
+                    LanDiscovery.build_announcement(item["network"], {k: v for k, v in item.items() if k not in ("pubkey", "record")})
+                    for item in self._hello_networks()
+                ]
                 if announcements:
                     self.discovery.announce(announcements)
         except Exception as exc:
@@ -2825,7 +2927,12 @@ class MDAClientGUI:
             messagebox.showinfo("Networks Nearby", "Select a network first.", parent=self._nearby_window)
             return
         item = self._nearby_items.get(selection[0])
-        if item:
+        if not item:
+            return
+        if item.get("seen_from"):
+            # The announcement is small; ask the owner directly for its routes and key.
+            self._lookup_and_join(f"{item['seen_from']}:{int(item.get('port') or mda.PORT)}", preferred=item.get("network"))
+        else:
             self._join_from_summary(item, parent=self._nearby_window)
 
     def _join_from_summary(self, summary, parent=None):
@@ -2848,6 +2955,11 @@ class MDAClientGUI:
                 "pubkey": str(summary.get("pubkey", "")),
             }
         }
+        record = summary.get("record")
+        if isinstance(record, dict) and mda_p2p.verify_record(record):
+            nodes[str(owner)]["record"] = record
+            if self.node and self.node.transport:
+                self.node.transport.learn_record(record)
         net_type = str(summary.get("type", "private")).lower()
         try:
             min_approvals = max(1, int(summary.get("min_approvals", 2)))
@@ -2878,12 +2990,18 @@ class MDAClientGUI:
         address = values.get("address", "").strip()
         if not address:
             return
-        endpoint = address if ":" in address else f"{address}:{mda.PORT}"
+        if address.count(":") > 1 and not address.startswith("["):
+            endpoint = f"[{address}]:{mda.PORT}"  # bare IPv6 address
+        else:
+            endpoint = address if ":" in address else f"{address}:{mda.PORT}"
         try:
-            parse_peer(endpoint)
+            mda_p2p.split_endpoint(endpoint)
         except ValueError:
             messagebox.showerror("Join by Address", f"'{address}' is not a valid address.")
             return
+        self._lookup_and_join(endpoint)
+
+    def _lookup_and_join(self, endpoint, preferred=None):
         node = self.node
         self._log(f"Looking up networks at {endpoint}…")
 
@@ -2893,11 +3011,11 @@ class MDAClientGUI:
                 error = "" if reply else "That computer runs an older MDANetPro version."
             except (OSError, ValueError) as exc:
                 reply, error = None, str(exc) or exc.__class__.__name__
-            self.ui_calls.put(lambda: self._finish_join_by_address(endpoint, reply, error))
+            self.ui_calls.put(lambda: self._finish_join_by_address(endpoint, reply, error, preferred))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_join_by_address(self, endpoint, reply, error):
+    def _finish_join_by_address(self, endpoint, reply, error, preferred=None):
         if reply is None:
             if messagebox.askyesno(
                 "Join by Address",
@@ -2907,7 +3025,13 @@ class MDAClientGUI:
             ):
                 self.test_connection(extra_targets=[endpoint])
             return
-        networks = [item for item in reply.get("networks", []) if isinstance(item, dict) and item.get("network")]
+        networks = [dict(item) for item in reply.get("networks", []) if isinstance(item, dict) and item.get("network")]
+        record = reply.get("record") if isinstance(reply.get("record"), dict) else None
+        for item in networks:
+            if record and mda_p2p.verify_record(record) and record.get("node") == item.get("endpoint"):
+                item["record"] = record
+        if preferred:
+            networks = [item for item in networks if item["network"] == preferred] or networks
         if not networks:
             messagebox.showinfo("Join by Address", "That computer is reachable, but it has no networks open for joining.")
             return
@@ -2924,6 +3048,204 @@ class MDAClientGUI:
             chosen = next((item for item in networks if item["network"] == values.get("network")), None)
             if chosen:
                 self._join_from_summary(chosen)
+
+    # ------------------------------------------------------------------
+    # Internet (P2P): route records, relays, NAT check
+    # ------------------------------------------------------------------
+    def _record_for_endpoint(self, endpoint):
+        transport = self.node.transport if self.node else None
+        if transport and endpoint in transport.records:
+            return transport.records[endpoint]
+        for info in self.networks.values():
+            for entry in (info.get("nodes") or {}).values():
+                if isinstance(entry, dict) and entry.get("endpoint") == endpoint and isinstance(entry.get("record"), dict):
+                    return entry["record"]
+        if endpoint == self._local_endpoint() and transport:
+            return transport.local_record
+        return None
+
+    def _learn_records_from_nodes(self, nodes):
+        if not (self.node and self.node.transport) or not isinstance(nodes, dict):
+            return
+        for entry in nodes.values():
+            if isinstance(entry, dict) and isinstance(entry.get("record"), dict):
+                record = entry["record"]
+                if self._same_pubkey(record.get("pubkey"), entry.get("pubkey")) or not entry.get("pubkey"):
+                    self.node.transport.learn_record(record)
+
+    def _load_records_into_transport(self):
+        for info in self.networks.values():
+            self._learn_records_from_nodes(info.get("nodes") or {})
+
+    def _relay_allowed(self, pubkey):
+        """Who may use this computer as a relay: members of our networks and pending joiners."""
+        pubkey = str(pubkey or "").strip()
+        if not pubkey:
+            return False
+        if time.time() - self._recent_join_requesters.get(pubkey, 0) < 3600:
+            return True
+        for info in list(self.networks.values()):
+            for entry in list((info.get("nodes") or {}).values()):
+                if isinstance(entry, dict) and self._same_pubkey(entry.get("pubkey"), pubkey):
+                    return True
+        return False
+
+    def _start_nat_check(self):
+        if not (self.node and self.node.transport) or self._nat_check_running:
+            return
+        self._nat_check_running = True
+        node, use_upnp = self.node, self.use_upnp
+
+        def worker():
+            try:
+                result = node.transport.discover_nat(use_upnp=use_upnp)
+            except Exception as exc:
+                result = {"error": str(exc)}
+
+            def done():
+                self._nat_check_running = False
+                self._last_nat_check = time.time()
+                mapping = (result or {}).get("mapping") or {}
+                stun = (result or {}).get("stun") or {}
+                if mapping.get("usable"):
+                    self._log(f"Router opened port {mapping.get('tcp_port')} automatically ({mapping.get('method')}).")
+                elif mapping:
+                    self._log("Router accepted the port request, but it is behind another NAT (not reachable from the internet).")
+                if stun.get("public"):
+                    self._log(f"Internet address {stun['public'][0]} (NAT type: {stun.get('nat')}).")
+                else:
+                    self._log("Could not reach STUN servers: internet connections may only work through relays.")
+                self._choose_relays()
+                self._update_status()
+
+            self.ui_calls.put(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _p2p_tick(self):
+        try:
+            if self.node and self.node.transport:
+                if time.time() - self._last_nat_check > 600 and self._last_nat_check:
+                    mda_netutils.invalidate_cache()
+                    self._start_nat_check()  # renew the router port mapping and STUN address
+                self._choose_relays()
+                cutoff = time.time() - 3600
+                for key in [k for k, v in self._recent_join_requesters.items() if v < cutoff]:
+                    del self._recent_join_requesters[key]
+                self._update_status()
+        finally:
+            self.root.after(15000, self._p2p_tick)
+
+    def _choose_relays(self):
+        """Behind NAT: keep a connection open to up to two reachable members (seed/trusted first)."""
+        if not (self.node and self.node.transport):
+            return
+        transport = self.node.transport
+        if transport.is_reachable():
+            if transport.relays:
+                transport.set_relays([])
+            return
+        local = self._local_endpoint()
+        rank = {"seed": 0, "trusted": 1}
+        candidates = []
+        for network_name, info in self.networks.items():
+            pending = info.get("membership_status") == "pending_approval"
+            for node_key, entry in (info.get("nodes") or {}).items():
+                endpoint = self._extract_node_endpoint(entry)
+                if not endpoint or endpoint == local:
+                    continue
+                record = transport.records.get(endpoint)
+                if not (record and record.get("reachable")):
+                    continue
+                role = self._extract_node_role(node_key, entry)
+                score = (0 if pending else 1, rank.get(role, 2))
+                candidates.append((score, endpoint))
+        candidates.sort()
+        chosen = []
+        for _score, endpoint in candidates:
+            if endpoint not in chosen:
+                chosen.append(endpoint)
+        chosen = chosen[:2]
+        if chosen != transport.relays:
+            transport.set_relays(chosen)
+            if chosen:
+                names = ", ".join(self._nickname_for_endpoint(e) or e for e in chosen)
+                self._log(f"Behind NAT: others will reach you through {names}.")
+
+    def _on_local_record_changed(self, record):
+        """Our routes changed: store them in our own node entries and tell the others."""
+        local_pubkey = self.identity.get("public_key_pem", "")
+        for info in self.networks.values():
+            for entry in (info.get("nodes") or {}).values():
+                if isinstance(entry, dict) and self._same_pubkey(entry.get("pubkey"), local_pubkey):
+                    entry["record"] = record
+        self._refresh_hello_cache()
+        self._update_status()
+        if not self._routes_broadcast_pending:
+            self._routes_broadcast_pending = True
+            self.root.after(1500, self._broadcast_routes)
+
+    def _broadcast_routes(self):
+        self._routes_broadcast_pending = False
+        if not (self.node and self.node.transport and self.node.transport.local_record):
+            return
+        self._save_state()
+        payload = {"type": "control", "action": "routes_update", "network": "", "sender": self.node.nodeid,
+                   "record": self.node.transport.local_record}
+        local = self._local_endpoint()
+        targets = set()
+        for network_name in self.networks:
+            targets.update(self._network_endpoints(network_name))
+        targets = sorted(t for t in targets if t and t != local)
+        node = self.node
+
+        def worker():
+            for endpoint in targets:
+                try:
+                    node.send_control_message(endpoint, payload, timeout=4)
+                except (OSError, ValueError):
+                    continue
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_routes_update(self, packet):
+        record = packet.get("record")
+        if not (self.node and self.node.transport and isinstance(record, dict)):
+            return
+        if not mda_p2p.verify_record(record):
+            self._log("Ignored a routes update with an invalid signature.")
+            return
+        is_new = self.node.transport.learn_record(record)
+        if is_new and self._relay_allowed(record.get("pubkey")):
+            # Pass newer routes on once (dedup by record time): members behind NAT learn each other.
+            sender = str(packet.get("sender", ""))
+            targets = set()
+            for network_name in self.networks:
+                targets.update(self._network_endpoints(network_name))
+            targets = sorted(t for t in targets if t and t not in (sender, record["node"], self._local_endpoint()))
+            node = self.node
+            forward = {"type": "control", "action": "routes_update", "network": "", "sender": node.nodeid, "record": record}
+
+            def worker():
+                for endpoint in targets:
+                    try:
+                        node.send_control_message(endpoint, forward, timeout=4)
+                    except (OSError, ValueError):
+                        continue
+
+            threading.Thread(target=worker, daemon=True).start()
+        changed = False
+        for info in self.networks.values():
+            for entry in (info.get("nodes") or {}).values():
+                if isinstance(entry, dict) and self._same_pubkey(entry.get("pubkey"), record.get("pubkey")):
+                    old = self._extract_node_endpoint(entry)
+                    if old != record["node"]:
+                        self._rename_endpoint(old, record["node"])
+                        entry["endpoint"] = record["node"]
+                    entry["record"] = record
+                    changed = True
+        if changed:
+            self._save_state()
 
     # ------------------------------------------------------------------
     # Firewall
@@ -3060,7 +3382,8 @@ class MDAClientGUI:
                     return
             except tk.TclError:
                 return
-            lines = [f"Your address: {node.nodeid}   Network: {network_name}", ""]
+            lines = [f"Network: {network_name}   This computer: {node.host}",
+                     f"Internet: {node.transport.connectivity_summary() if node.transport else 'n/a'}", ""]
             need_firewall = firewall.get("supported") and not firewall.get("ok")
             suggested = ""
             if firewall.get("supported"):
@@ -3078,14 +3401,23 @@ class MDAClientGUI:
                     lines.append("    Ask its owner to open MDANetPro and click 'Allow network access'.")
                 elif result["callback_ok"]:
                     lines.append(f"✅ {label}: connected both ways.")
+                    if result.get("route"):
+                        lines.append(f"    you → them: {result['route']}")
+                    if result.get("callback_route"):
+                        lines.append(f"    them → you: {result['callback_route']}")
                 else:
                     need_firewall = need_firewall or mda_firewall.is_supported()
                     lines.append(f"⚠️ {label}: you can reach it, but it can't reach you back.")
-                    lines.append("    This computer is blocking incoming connections. Click 'Allow network access'.")
+                    if mda_p2p.is_virtual(endpoint) and node.transport and not node.transport.is_reachable() and not node.transport.relays:
+                        lines.append("    You are behind a router (NAT) and have no relay yet. A member who is reachable from")
+                        lines.append("    the internet (e.g. the network owner with UPnP or a port-forward) is needed.")
+                    else:
+                        lines.append("    This computer is blocking incoming connections. Click 'Allow network access'.")
                     if result.get("error"):
                         lines.append(f"    ({result['error']})")
                 seen_ip = result.get("seen_ip", "")
-                if result["connect_ok"] and seen_ip and seen_ip != node.host:
+                same_network_route = str(result.get("route", "")).startswith("direct (same network)") or not mda_p2p.is_virtual(endpoint)
+                if result["connect_ok"] and same_network_route and seen_ip and seen_ip != node.host:
                     if seen_ip in local_ips:
                         suggested = seen_ip
                         lines.append(f"    It sees you as {seen_ip}, but you announce {node.host}. Click 'Use suggested address'.")

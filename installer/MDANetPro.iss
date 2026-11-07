@@ -46,7 +46,7 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""MDANetPro discovery (UDP {#DiscoveryPort})"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""MDANetPro ping"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MDANetPro node (TCP {#NodePort})"" dir=in action=allow protocol=TCP localport={#NodePort} profile=any"; Flags: runhidden
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MDANetPro discovery (UDP {#DiscoveryPort})"" dir=in action=allow protocol=UDP localport={#DiscoveryPort} profile=any"; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MDANetPro discovery (UDP {#DiscoveryPort})"" dir=in action=allow protocol=UDP localport={#NodePort},{#DiscoveryPort} profile=any"; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MDANetPro ping"" dir=in action=allow protocol=icmpv4:8,any profile=any"; Flags: runhidden
 Filename: "{app}\{#AppExe}"; Description: "Start {#AppName}"; Flags: nowait postinstall skipifsilent
 
