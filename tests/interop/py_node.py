@@ -48,19 +48,24 @@ def endpoint_of(nick):
     return next((c["endpoint"] for c in app.contacts if c.get("nickname") == nick), "")
 
 
+MEMBER = os.environ.get("MEMBER", "Kotty")
 try:
     pump(2)
     if app._wizard:
         app._wizard.destroy()
+    if os.environ.get("PUBLIC"):  # e.g. 10.0.2.2:50404 = this PC as seen from the Android emulator
+        app.public_address = os.environ["PUBLIC"]
+        app.node.transport.manual_public = app.public_address
+        app.node.transport.refresh_local_record()
     pump(15, until=lambda: app._last_nat_check > 0)
     if role == "seed":
         app._create_network("Interop", "private", "seed", 1, "", [], True)
         open(os.path.join(share, "py_seed.ready"), "w").close()
-        check("Kotlin member joined (approved here)", pump(150, until=lambda: endpoint_of("Kotty")))
+        check(f"{MEMBER} joined (approved here)", pump(300, until=lambda: endpoint_of(MEMBER)))
         pump(4)
-        app.send_to_peer(endpoint_of("Kotty"), "welcome Kotty")
-        check("got reply from the Kotlin member", pump(90, until=lambda: "thanks from Kotty" in chat_text()))
-        pump(15)
+        app.send_to_peer(endpoint_of(MEMBER), f"welcome {MEMBER}")
+        check(f"got reply from {MEMBER}", pump(240, until=lambda: f"thanks from {MEMBER}" in chat_text()))
+        pump(30)
     else:
         ready = os.path.join(share, "kt_seed.ready")
         check("Kotlin seed ready", pump(90, until=lambda: os.path.exists(ready)))
