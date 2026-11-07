@@ -574,7 +574,24 @@ class P2PTransport:
         raise OSError("no direct route: " + "; ".join(errors))
 
     def _send_via_relay(self, relay, endpoint, payload, timeout):
-        reply = self._send_direct_only(relay, {"type": "relay_forward", "to": endpoint, "packet": payload}, timeout + 1)
+        forward = {"type": "relay_forward", "to": endpoint, "packet": payload}
+        try:
+            reply = self._send_direct_only(relay, forward, timeout + 1)
+        except OSError:
+            # We may not know the relay itself (e.g. a web gateway): use the addresses the
+            # target listed for it in its own signed record.
+            reply = None
+            for route in (self.records.get(endpoint) or {}).get("routes", []):
+                if route.get("t") == "relay" and route.get("a") == relay:
+                    for address in route.get("via") or []:
+                        try:
+                            host, port = split_endpoint(address)
+                            reply = self.node._send_tcp(host, port, forward, timeout + 1)
+                            break
+                        except (OSError, ValueError):
+                            continue
+            if reply is None:
+                raise
         if not isinstance(reply, dict) or reply.get("type") != "relay_result":
             raise OSError("relay gave no answer")
         if not reply.get("ok"):

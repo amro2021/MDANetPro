@@ -25,6 +25,7 @@ from client_storage import ClientStorage
 from mda_discovery import DISCOVERY_PORT, LanDiscovery
 import mda_netutils
 import mda_p2p
+import mda_webgateway
 from mda_netutils import best_local_ip, candidate_ips, local_ip_for
 from mdanetwork import mda
 from net_profile import export_mdar_file, import_mdar_file
@@ -151,6 +152,8 @@ class MDAClientGUI:
         self.host_mode = "auto"  # "auto": pick and follow the right IP; "manual": use host_var as typed
         self.use_upnp = True  # ask the home router to open the port automatically
         self.public_address = ""  # optional "ip-or-name[:port]" of a manual router port-forward
+        self.web_gateway_mode = "this computer"  # "off" | "this computer" | "all devices": web app access
+        self.web_gateway = None
         self._recent_join_requesters = {}  # pubkey -> time (allowed to use us as relay while pending)
         self._routes_broadcast_pending = False
         self._nat_check_running = False
@@ -396,6 +399,8 @@ class MDAClientGUI:
         self.port_var.set(str(node_data.get("port", self.port_var.get())))
         self.use_upnp = bool(node_data.get("use_upnp", True))
         self.public_address = str(node_data.get("public_address", "")).strip()
+        mode = str(node_data.get("web_gateway", "this computer")).strip().lower()
+        self.web_gateway_mode = mode if mode in ("off", "this computer", "all devices") else "this computer"
         self.setup_done = bool(payload.get("setup_done", True))
         self.active_network_var.set(str(payload.get("active_network", self.active_network_var.get())))
 
@@ -484,6 +489,7 @@ class MDAClientGUI:
                 "host_mode": self.host_mode,
                 "use_upnp": bool(self.use_upnp),
                 "public_address": self.public_address,
+                "web_gateway": self.web_gateway_mode,
                 "port": self.port_var.get().strip(),
             },
             "setup_done": bool(self.setup_done),
@@ -1426,6 +1432,7 @@ class MDAClientGUI:
         self._sync_node_peers_for_active_network()
         self._start_discovery()
         self._start_nat_check()
+        self._start_web_gateway()
         self._update_status()
         self._log(f"Node started on {self.node.nodeid}")
         self._save_state()
@@ -1434,7 +1441,28 @@ class MDAClientGUI:
             self._announce_address_change(old_endpoints)
         self._check_firewall_async()
 
+    def _start_web_gateway(self):
+        """WebSocket access for the MDANetPro web app (browser)."""
+        if self.web_gateway is not None or not self.node or self.web_gateway_mode == "off":
+            return
+        host = "127.0.0.1" if self.web_gateway_mode == "this computer" else "0.0.0.0"
+        try:
+            self.web_gateway = mda_webgateway.WebGateway(
+                self.node, host=host, port=mda_webgateway.WS_PORT,
+                log=lambda text: self.ui_calls.put(lambda: self._log(text)),
+            ).start()
+            self._log(f"Web app access: ws://{'localhost' if host == '127.0.0.1' else self.node.host}:{mda_webgateway.WS_PORT}")
+        except OSError as exc:
+            self.web_gateway = None
+            self._log(f"Web app access unavailable (port {mda_webgateway.WS_PORT}: {exc}).")
+
+    def _stop_web_gateway(self):
+        if self.web_gateway is not None:
+            self.web_gateway.stop()
+            self.web_gateway = None
+
     def stop_node(self):
+        self._stop_web_gateway()
         if self.discovery is not None:
             self.discovery.stop()
             self.discovery = None
@@ -1461,6 +1489,7 @@ class MDAClientGUI:
                 {"name": "host", "label": "Address (\"auto\" = detect automatically)", "initial": "auto" if self.host_mode == "auto" else self.host_var.get()},
                 {"name": "use_upnp", "label": "Open router port automatically (UPnP)", "initial": "yes" if self.use_upnp else "no", "kind": "combobox", "options": ["yes", "no"]},
                 {"name": "public_address", "label": "Public address of a router port-forward (optional)", "initial": self.public_address},
+                {"name": "web_gateway", "label": "Web app access (WebSocket port 50406)", "initial": self.web_gateway_mode, "kind": "combobox", "options": ["this computer", "all devices", "off"]},
                 {"name": "port", "label": "Port", "initial": self.port_var.get()},
             ],
             submit_label="Save Settings",
@@ -1474,6 +1503,11 @@ class MDAClientGUI:
         use_upnp = str(values.get("use_upnp", "yes")).strip().lower() != "no"
         public_address = str(values.get("public_address", "")).strip()
         nat_changed = use_upnp != self.use_upnp or public_address != self.public_address
+        web_mode = str(values.get("web_gateway", self.web_gateway_mode)).strip().lower()
+        if web_mode in ("off", "this computer", "all devices") and web_mode != self.web_gateway_mode:
+            self.web_gateway_mode = web_mode
+            self._stop_web_gateway()
+            self._start_web_gateway()
         self.use_upnp, self.public_address = use_upnp, public_address
         if self.node and self.node.transport:
             self.node.transport.manual_public = public_address

@@ -29,3 +29,5 @@ experiment_manifest*/
 android/.gradle/
 android/**/build/
 android/local.properties
+tests/web/node_modules/
+tests/web/package-lock.json

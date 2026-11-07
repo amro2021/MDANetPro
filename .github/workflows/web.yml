@@ -1,0 +1,72 @@
+name: Web app
+on:
+  push:
+    branches: [main, feature/web-app]
+    paths: ["web/**", "mda*.py", "mdaclient.py", "mdanetwork.py", "tests/web/**", "tests/interop/**", ".github/workflows/web.yml"]
+  pull_request:
+    paths: ["web/**", "mda*.py", "mdaclient.py", "mdanetwork.py", "tests/web/**", "tests/interop/**", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q python3-tk xvfb
+          python3 -m pip install --break-system-packages -q pycryptodome peewee psutil
+          cd tests/web && npm install --silent
+      - name: "Web engine (Node.js) joins the Python app through its built-in gateway"
+        run: |
+          SHARE=$(mktemp -d)
+          MEMBER=Webby xvfb-run -a python3 tests/interop/py_node.py seed "$SHARE" > "$SHARE/py.log" 2>&1 & PY=$!
+          for i in $(seq 1 60); do [ -f "$SHARE/py_seed.ready" ] && break; sleep 1; done
+          node tests/web/node_member.mjs ws://127.0.0.1:50406 Webby Interop Amr || FAIL=1
+          wait $PY || FAIL=1
+          grep -E "PASS|FAIL|RESULT|ERROR" "$SHARE/py.log"; [ -z "$FAIL" ]
+      - name: "Web engine joins through a separate gateway server (mda_gateway.py)"
+        run: |
+          SHARE=$(mktemp -d)
+          python3 mda_gateway.py --port 52404 --ws-port 52406 --no-upnp > "$SHARE/gw.log" 2>&1 & GW=$!
+          MEMBER=Webby xvfb-run -a python3 tests/interop/py_node.py seed "$SHARE" > "$SHARE/py.log" 2>&1 & PY=$!
+          for i in $(seq 1 60); do [ -f "$SHARE/py_seed.ready" ] && break; sleep 1; done
+          node tests/web/node_member.mjs ws://127.0.0.1:52406 Webby Interop Amr 127.0.0.1:50404 || FAIL=1
+          wait $PY || FAIL=1
+          kill $GW
+          grep -E "PASS|FAIL|RESULT|ERROR" "$SHARE/py.log"; [ -z "$FAIL" ]
+      - name: "Web app in Chrome joins the Python app, chats, survives a reload"
+        run: |
+          SHARE=$(mktemp -d)
+          (cd web && python3 -m http.server 8080 > /dev/null 2>&1 &)
+          MEMBER=Browsy xvfb-run -a python3 tests/interop/py_node.py seed "$SHARE" > "$SHARE/py.log" 2>&1 & PY=$!
+          for i in $(seq 1 60); do [ -f "$SHARE/py_seed.ready" ] && break; sleep 1; done
+          node tests/web/browser_member.mjs http://localhost:8080/ web-shots "$(which google-chrome)" || FAIL=1
+          wait $PY || FAIL=1
+          grep -E "PASS|FAIL|RESULT|ERROR" "$SHARE/py.log"; [ -z "$FAIL" ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: web-screenshots, path: web-shots }
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: web }
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -375,7 +375,25 @@ class Transport(private val node: Node, stunServers: List<Pair<String, Int>>? = 
     }
 
     private fun sendViaRelay(relay: String, endpoint: String, payload: Map<String, Any?>, timeoutMs: Int): MutableMap<String, Any?>? {
-        val reply = sendDirectOnly(relay, jsonObj("type" to "relay_forward", "to" to endpoint, "packet" to payload), timeoutMs + 1000)
+        val forward = jsonObj("type" to "relay_forward", "to" to endpoint, "packet" to payload)
+        val reply = try {
+            sendDirectOnly(relay, forward, timeoutMs + 1000)
+        } catch (e: Exception) {
+            // Unknown relay (e.g. a web gateway): use the addresses the target listed for it.
+            val via = Records.routes(records[endpoint]).firstOrNull { it["t"] == "relay" && it.str("a") == relay }?.get("via").asList()
+            var answer: MutableMap<String, Any?>? = null
+            var ok = false
+            for (address in via ?: emptyList()) {
+                try {
+                    val (h, p) = Endpoint.split(address.toString())
+                    answer = node.sendTcp(h, p, forward, timeoutMs + 1000)
+                    ok = true
+                    break
+                } catch (_: Exception) {}
+            }
+            if (!ok) throw e
+            answer
+        }
         if (reply == null || reply["type"] != "relay_result") throw java.io.IOException("relay gave no answer")
         if (reply["ok"] != true) throw java.io.IOException("relay: ${reply["error"] ?: "failed"}")
         return reply["reply"].asMap()
