@@ -1,0 +1,5 @@
+<resources>
+    <style name="Theme.MDANetPro" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#1F4E79</item>
+    </style>
+</resources>

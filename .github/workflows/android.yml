@@ -2,16 +2,68 @@ name: Android APK
 on:
   push:
     branches: [feature/android-app, main]
-    paths: ["android/**", ".github/workflows/android.yml"]
+    paths: ["android/**", "mda*.py", "mdaclient.py", "mdanetwork.py", "tests/interop/**", ".github/workflows/android.yml"]
+  pull_request:
+    paths: ["android/**", "mda*.py", "mdaclient.py", "mdanetwork.py", "tests/interop/**", ".github/workflows/android.yml"]
   workflow_dispatch:
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-and-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
-      - name: Probe
+
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.10.2" }
+
+      - name: Python app dependencies
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"; ls $ANDROID_HOME/platforms | tail -3; ls $ANDROID_HOME/build-tools | tail -3
-          java -version
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-tk xvfb
+          python3 -m pip install --break-system-packages -q pycryptodome peewee psutil
+
+      - name: Python fixtures for Kotlin tests
+        run: python3 tests/interop/make_fixtures.py "$RUNNER_TEMP/fixtures"
+
+      - name: Kotlin unit tests (incl. Python fixtures)
+        env: { MDA_FIXTURES: "${{ runner.temp }}/fixtures" }
+        run: gradle -p android :core:test --console=plain
+
+      - name: Build APK
+        run: gradle -p android :app:assembleDebug :cli:installDist --console=plain
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MDANetPro-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: "Interop 1: Kotlin member joins the Python app"
+        run: |
+          SHARE=$(mktemp -d)
+          xvfb-run -a python3 tests/interop/py_node.py seed "$SHARE" > "$SHARE/py.log" 2>&1 &
+          PY=$!
+          for i in $(seq 1 60); do [ -f "$SHARE/py_seed.ready" ] && break; sleep 1; done
+          android/cli/build/install/cli/bin/cli member --data "$SHARE/kt" --name Kotty --port 50414 \
+            --join 127.0.0.1:50404 --network Interop --expect "welcome Kotty" --reply-to Amr --reply "thanks from Kotty" \
+            --timeout 150 --linger 25 | tee "$SHARE/kt.log" || KT_FAIL=1
+          wait $PY || PY_FAIL=1
+          echo "----- Python seed -----"; grep -v "received:" "$SHARE/py.log" | tail -60
+          [ -z "$KT_FAIL" ] && [ -z "$PY_FAIL" ]
+
+      - name: "Interop 2: Python app joins a Kotlin seed"
+        run: |
+          SHARE=$(mktemp -d)
+          android/cli/build/install/cli/bin/cli seed --data "$SHARE/kt" --name KSeed --port 50414 --network KNet \
+            --ready-file "$SHARE/kt_seed.ready" --wait-member Pyno --greet-prefix welcome --expect "thanks from Pyno" \
+            --timeout 150 --linger 15 > "$SHARE/kt.log" 2>&1 &
+          KT=$!
+          xvfb-run -a python3 tests/interop/py_node.py member "$SHARE" | grep -v "received:" | tee "$SHARE/py.log"
+          PY_STATUS=${PIPESTATUS[0]}
+          wait $KT || KT_FAIL=1
+          echo "----- Kotlin seed -----"; cat "$SHARE/kt.log" | tail -60
+          [ "$PY_STATUS" = "0" ] && [ -z "$KT_FAIL" ]
