@@ -141,7 +141,7 @@ fun AppScreen(activity: MainActivity) {
 @Composable
 fun SetupScreen(s: Engine.Snapshot, activity: MainActivity) {
     val engine = MdaApp.instance.engine
-    var name by remember { mutableStateOf(s.settings.name.takeIf { it != "node" } ?: "") }
+    var name by remember { mutableStateOf(s.settings.name.takeIf { it != "node" && it != "root" } ?: "") }
     var networkName by remember { mutableStateOf("") }
     var step by remember { mutableStateOf(1) }
     Column(Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {

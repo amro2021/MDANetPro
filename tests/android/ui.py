@@ -14,11 +14,17 @@ def nodes():
     return out
 
 def find(label, timeout=30, exact=False):
+    """Exact text match first; otherwise the shortest text containing the label."""
     end = time.time() + timeout
     while time.time() < end:
-        for text, x, y in nodes():
-            if (text == label) if exact else (label.lower() in text.lower()):
+        found = nodes()
+        for text, x, y in found:
+            if text == label:
                 return x, y
+        if not exact:
+            partial = sorted((len(t), x, y) for t, x, y in found if label.lower() in t.lower())
+            if partial:
+                return partial[0][1], partial[0][2]
         time.sleep(1)
     return None
 

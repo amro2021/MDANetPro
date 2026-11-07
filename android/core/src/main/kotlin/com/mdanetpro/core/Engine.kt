@@ -111,7 +111,7 @@ class Engine(
         val id = state?.get("identity").asMap()
         identity = if (id != null) Crypto.loadIdentity(id.str("private_key_pem"), id.str("public_key_pem")) else Crypto.generateIdentity()
         if (state == null) {
-            nodeName = System.getProperty("user.name")?.take(32)?.ifBlank { null } ?: "node"
+            nodeName = System.getProperty("user.name")?.take(32)?.takeIf { it.isNotBlank() && it != "root" } ?: "node"
             save()
             return
         }
