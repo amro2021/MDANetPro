@@ -43,7 +43,9 @@ class Node(
     // ---------------------------------------------------------------- server
     fun start() {
         val s = ServerSocket()
-        s.reuseAddress = false
+        // Linux/Android: allow rebinding while old connections sit in TIME_WAIT (as the Python node does).
+        // Windows: SO_REUSEADDR would let two processes share the port, so leave it off there.
+        s.reuseAddress = !System.getProperty("os.name", "").startsWith("Windows")
         s.bind(InetSocketAddress(port), 32) // wildcard: IPv4 and IPv6 where available
         server = s
         thread("mda-accept") {

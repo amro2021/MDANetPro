@@ -60,7 +60,7 @@ fun main(args: Array<String>) {
         "seed" -> {
             engine.createNetwork(network, minApprovals = 1)
             File(opts["ready-file"] ?: "seed.ready").writeText(engine.query { localEndpoint() })
-            waitFor("got a join request") { synchronized(pending) { pending.isNotEmpty() } }
+            if (!waitFor("got a join request") { synchronized(pending) { pending.isNotEmpty() } }) finish(engine, checks)
             val request = synchronized(pending) { pending.first() }
             engine.approveJoin(request.id)
             val member = opts["wait-member"] ?: request.nickname
@@ -72,6 +72,10 @@ fun main(args: Array<String>) {
         }
         else -> usage()
     }
+    finish(engine, checks)
+}
+
+private fun finish(engine: Engine, checks: Map<String, Boolean>): Nothing {
     engine.query { snapshot().logs }.takeLast(40).forEach { println("LOG $it") }
     val failed = checks.count { !it.value }
     println("RESULT: " + if (failed == 0) "ALL PASSED" else "$failed FAILED")
