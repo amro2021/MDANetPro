@@ -24,3 +24,10 @@ experiment_data*/
 experiment_manifest*/
 *.mdar
 .fuse_hidden*
+
+# Android / Gradle
+android/.gradle/
+android/**/build/
+android/local.properties
+tests/web/node_modules/
+tests/web/package-lock.json

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1F4E79">
+  <title>MDANetPro</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header id="topbar"><span id="title">MDANetPro</span><span id="conn" class="pill"></span></header>
+    <main id="main"></main>
+    <nav id="tabs" hidden>
+      <button data-tab="chats"><span class="ico">💬</span>Chats<span id="unread" class="badge" hidden></span></button>
+      <button data-tab="networks"><span class="ico">⬡</span>Networks</button>
+      <button data-tab="status"><span class="ico">ⓘ</span>Status</button>
+    </nav>
+  </div>
+  <dialog id="dialog"></dialog>
+  <script type="module" src="js/ui.js"></script>
+</body>
+</html>
