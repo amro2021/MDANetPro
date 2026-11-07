@@ -25,8 +25,83 @@ MDANetPro is a lightweight peer-to-peer networking/chat prototype built in Pytho
      ```
 3. Install dependencies:
    ```bash
-   pip install pycryptodome
+   pip install pycryptodome peewee psutil   # psutil is optional
    ```
+
+## Quick start (no technical setup)
+
+1. Open **MDANetClient**. A 3-step **Setup Wizard** appears on first run:
+   1. Type your name (what others will see).
+   2. Click **Allow network access** and answer *Yes* on the Windows prompt (once per computer).
+      The installer does this for you, so installed copies skip this step.
+   3. **Create my network**, or **Join a network nearby**.
+2. To join, open **Networks Nearby**, select the network, and click **Join**. The owner gets an approval popup;
+   once approved, you get a "You joined" message and the members appear in your contacts.
+3. If something doesn't work, click **Test Connection**. It checks both directions with every member and says,
+   in plain words, what to fix (firewall, wrong address, other computer off). It also offers a one-click fix.
+
+What happens automatically:
+- **Address:** the node listens on all network adapters and picks the right IP itself (Node > Node Settings,
+  Address = `auto`). If you move from Wi-Fi to a cable, it notices and tells your networks the new address
+  (signed with your key), so nobody has to re-export a `.mdar`.
+- **Identity:** nodes are recognised by their public key, so a node that changes IP is updated, not duplicated,
+  and two people can use the same name.
+- **Discovery:** seed/trusted nodes announce their networks on the local network (UDP 50405). You can turn this
+  off per network ("Show in 'Networks Nearby'" when creating a network).
+
+Not on the same Wi-Fi, or discovery blocked? Use **Network > Join by Address** (type the owner's IP) or a `.mdar` invite file.
+
+### Ports
+| Port | Protocol | Use |
+|---|---|---|
+| 50404 | TCP | node connections (messages, joins, connection test) |
+| 50404 | UDP | hole punching between members on different networks |
+| 50405 | UDP | Networks Nearby announcements |
+
+### Building the Windows installer
+1. `pip install pyinstaller pycryptodome peewee psutil` (`psutil` is optional; it improves adapter detection)
+2. `pyinstaller MDANetClient.spec` builds `dist\MDANetClient.exe`
+3. Compile `installer\MDANetPro.iss` with [Inno Setup](https://jrsoftware.org/isinfo.php) to get `installer\Output\MDANetPro-Setup.exe`.
+   The installer adds the firewall rules. App data is stored in `%LOCALAPPDATA%\MDANetPro`. A copy that already has
+   data next to it keeps using that folder.
+
+### Tests
+`python tests/e2e_easy_setup.py` and `python tests/e2e_failure_paths.py` run real nodes on this computer
+(close MDANetPro first; they use ports 50404–50434).
+
+## Connecting across different networks (internet, peer-to-peer)
+
+Members don't have to be on the same Wi-Fi. There is no central server: nodes talk directly, and
+other members help only when a direct path is impossible.
+
+**Addresses.** Each node's address is derived from its key, e.g. `3f9a0c2e5b7d11aa8c42.mda:50404`, so it
+stays the same when the IP changes and can't be impersonated. Each node publishes a *signed route record*
+with every way to reach it right now. Records travel with join requests, member lists, `.mdar` files and
+updates.
+
+**How a connection is made**, tried in this order:
+1. **Same network**: the LAN address, when both are behind the same router.
+2. **IPv6**: direct, when both sides have a global IPv6 address.
+3. **Public port**: opened automatically on the home router with **UPnP / NAT-PMP**, or a manual
+   port-forward (Node > Node Settings > *Public address*).
+4. **UDP hole punching**: both sides learn their public address from STUN servers and "punch" through
+   their NATs at the same time (introduced by a member they're both connected to).
+5. **Relay through a member**: a node behind NAT keeps a connection open to one or two reachable members
+   (seed/trusted first). Only members and pending joiners may use a relay. Messages stay end-to-end
+   encrypted (onion layers), so the relay can't read them.
+
+**What's needed:** at least one member who is reachable from the internet, usually the network owner,
+with a router that allows UPnP or has a port-forward for TCP+UDP 50404. Others can then join from anywhere
+with **Join by Address** (type the owner's public IP) or a `.mdar` file. The status bar and **Test Connection**
+show how each member is reached ("direct (internet)", "direct (UDP hole punch)", "via relay …").
+
+Mobile data and many university networks use symmetric/carrier NAT: hole punching won't work there, and
+those members are reached through a relay automatically.
+
+STUN servers default to public ones (Google, Cloudflare). Set `MDANET_STUN_SERVERS=host:port,host:port`
+to use your own (`python -c "import mda_stun,time; mda_stun.StunServer(); time.sleep(1e9)"` runs one).
+
+Tests: `tests/test_p2p_units.py`, and the simulated-internet tests in `tests/netsim/` (Linux, root).
 
 ## How to Use
 
