@@ -28,10 +28,9 @@ $UI shot 02-home
 step "join by address"
 $UI tap "Networks"
 $UI shot 03-networks
-$UI tap "By address"; $UI tap "e.g."; $UI type "10.0.2.2"; $UI tap "Find networks"
-sleep 4; $UI tap "OK" || true
+$UI tap "Join by address"; $UI tap "e.g."; $UI type "10.0.2.2"; $UI tap "Find networks"
 end
-if [ "$($UI wait 'You joined' 120)" = "PASS see You joined" ]; then echo "PASS app joined the PC network (approved through relay)"; else echo "FAIL app did not get the approval"; FAIL=1; fi
+if [ "$($UI waitdismiss 'You joined' 'Join request sent' 150)" = "PASS see You joined" ]; then echo "PASS app joined the PC network (approved through relay)"; else echo "FAIL app did not get the approval"; FAIL=1; fi
 $UI shot 04-joined
 $UI tap "OK" || true
 step "chat"
@@ -42,7 +41,7 @@ $UI tap "Amr"
 $UI tap "Message"; $UI type "thanks from Droid"; $UI tap "Send"
 sleep 3
 $UI shot 06-chat
-adb shell input keyevent KEYCODE_BACK; sleep 1
+$UI tap "Back"; sleep 1
 end
 step "status"
 $UI tap "Status"; $UI tap "Test connection"

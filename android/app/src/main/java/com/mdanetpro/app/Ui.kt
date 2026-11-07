@@ -276,11 +276,9 @@ fun NetworksTab(s: Engine.Snapshot, activity: MainActivity) {
                 }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { showCreate = true }) { Text("Create") }
-            OutlinedButton(onClick = { activity.pickInvite() }) { Text("Invite file") }
-            OutlinedButton(onClick = { showAddress = true }) { Text("By address") }
-        }
+        Button(onClick = { showCreate = true }, modifier = Modifier.fillMaxWidth()) { Text("Create a network") }
+        OutlinedButton(onClick = { showAddress = true }, modifier = Modifier.fillMaxWidth()) { Text("Join by address") }
+        OutlinedButton(onClick = { activity.pickInvite() }, modifier = Modifier.fillMaxWidth()) { Text("Join with an invite file (.mdar)") }
         HorizontalDivider()
         Text("Networks nearby", fontWeight = FontWeight.Bold, color = Navy)
         if (s.nearby.isEmpty()) Text("Looking… The owner's device must have MDANetPro open on the same Wi-Fi. Some Wi-Fi networks block this; use 'By address' instead.", fontSize = 13.sp, color = Color.Gray)

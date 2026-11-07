@@ -46,7 +46,22 @@ def screenshot(name):
     print(base64.b64encode(png).decode())
     print(f"=====SCREENSHOT {name} END=====", flush=True)
 
+def wait_dismissing(target, dismiss_when, timeout):
+    """Wait for `target` text; tap OK on dialogs containing `dismiss_when` meanwhile."""
+    end = time.time() + timeout
+    while time.time() < end:
+        texts = [t for t, _, _ in nodes()]
+        if any(target.lower() in t.lower() for t in texts):
+            return True
+        if any(dismiss_when.lower() in t.lower() for t in texts):
+            tap("OK", 5, exact=True)
+        time.sleep(1.5)
+    return False
+
 if __name__ == "__main__":
+    if sys.argv[1] == "waitdismiss":
+        print("PASS" if wait_dismissing(sys.argv[2], sys.argv[3], int(sys.argv[4])) else "FAIL", "see", sys.argv[2])
+        raise SystemExit
     cmd, *rest = sys.argv[1:]
     {"tap": lambda: tap(rest[0]), "type": lambda: type_text(rest[0]), "shot": lambda: screenshot(rest[0]),
      "wait": lambda: print("PASS" if find(rest[0], int(rest[1]) if len(rest) > 1 else 60) else "FAIL", "see", rest[0])}[cmd]()
