@@ -411,7 +411,7 @@ class Engine(
 
     private fun chooseRelays() {
         val t = node?.transport ?: return
-        if (t.isReachable()) { if (t.relays.isNotEmpty()) t.setRelays(emptyList()); return }
+        if (t.isReachable()) { if (t.relays.isNotEmpty()) t.updateRelays(emptyList()); return }
         val local = localEndpoint()
         val rank = mapOf("seed" to 0, "trusted" to 1)
         val candidates = ArrayList<Pair<Pair<Int, Int>, String>>()
@@ -426,7 +426,7 @@ class Engine(
         }
         val chosen = candidates.sortedWith(compareBy({ it.first.first }, { it.first.second })).map { it.second }.distinct().take(2)
         if (chosen != t.relays) {
-            t.setRelays(chosen)
+            t.updateRelays(chosen)
             if (chosen.isNotEmpty()) log("Behind NAT: others will reach you through ${chosen.joinToString { nicknameFor(it).ifEmpty { it } }}.")
         }
     }

@@ -71,6 +71,7 @@ class Transport(private val node: Node, stunServers: List<Pair<String, Int>>? = 
     val lastRoute = ConcurrentHashMap<String, String>()
     val relayStatus = ConcurrentHashMap<String, String>()
     @Volatile var relays: List<String> = emptyList()
+        private set
     @Volatile var manualPublic = ""
     @Volatile var stunPublic: Pair<String, Int>? = null
     @Volatile var natType = "unknown"
@@ -455,7 +456,7 @@ class Transport(private val node: Node, stunServers: List<Pair<String, Int>>? = 
         fun stop() { stopped = true; try { socket?.close() } catch (_: Exception) {} }
     }
 
-    fun setRelays(wanted: List<String>) {
+    fun updateRelays(wanted: List<String>) {
         val list = wanted.filter { it.isNotEmpty() && it != node.nodeId }.take(2)
         for (r in relayClients.keys.toList()) if (r !in list) { relayClients.remove(r)?.stop(); relayStatus.remove(r) }
         relays = list
