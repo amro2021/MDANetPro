@@ -5,6 +5,8 @@ import threading
 import time
 import uuid
 
+import mda_p2p
+
 from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
@@ -102,8 +104,13 @@ class mda:
         private_key_pem=None,
         public_key_pem=None,
         onion_body_size=None,
+        bind_host=None,
+        stun_servers=None,
+        p2p=True,
     ):
         self.host = host or self.get_local_ip()
+        # Listen on every adapter by default; self.host is only the address we advertise.
+        self.bind_host = "0.0.0.0" if bind_host is None else bind_host
         self.port = int(port or self.PORT)
         self.peers = []
         self.node_name = node_name or f"node-{self.port}"
@@ -117,20 +124,42 @@ class mda:
         self._circuits = {}
         self._sender_counter = 0
         self._seen_message_nonces = {}
+        # Optional callable returning a list of network summaries for "hello" lookups.
+        self.hello_provider = None
         if onion_body_size is None:
             onion_body_size = self.ONION_BODY_SIZE
         self.onion_body_size = max(128, int(onion_body_size))
         self._private_key, self._public_key = self._load_or_create_keys(private_key_pem, public_key_pem)
+        self.transport = None
+        if p2p:
+            # Stable address derived from our key; the IP is only one of several routes.
+            self.nodeid = mda_p2p.node_address(self.get_public_key_pem(), self.port)
+            self.transport = mda_p2p.P2PTransport(self, stun_servers=stun_servers)
         self._configure_peers(peers or [])
 
     @staticmethod
     def get_local_ip():
+        try:
+            from mda_netutils import best_local_ip
+            return best_local_ip()
+        except Exception:
+            pass
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             try:
                 sock.connect(("8.8.8.8", 80))
                 return sock.getsockname()[0]
             except OSError:
                 return "127.0.0.1"
+
+    def set_advertised_host(self, host):
+        """Change the address other nodes should use for us. Returns the old endpoint."""
+        old_endpoint = self.nodeid
+        self.host = str(host)
+        if self.transport is None:
+            self.nodeid = f"{self.host}:{self.port}"
+        else:
+            self.transport.refresh_local_record()
+        return old_endpoint
 
     @staticmethod
     def get_free_port():
@@ -144,8 +173,7 @@ class mda:
             host, port = value
             return str(host), int(port)
         if isinstance(value, str):
-            host, port = value.rsplit(":", 1)
-            return host, int(port)
+            return mda_p2p.split_endpoint(value)
         raise ValueError(f"Unsupported peer value: {value!r}")
 
     def _configure_peers(self, peers):
@@ -173,18 +201,58 @@ class mda:
         if self.server_socket:
             return self
 
+        dual_stack = self.bind_host in ("0.0.0.0", "::") and socket.has_ipv6
+        if dual_stack:
+            try:
+                self.server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                self.server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (OSError, AttributeError):
+                dual_stack = False
+        if not dual_stack:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_REUSEADDR would let a second copy of the app silently share the port.
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind(("::" if dual_stack else self.bind_host, self.port))
+        except OSError:
+            self.server_socket.close()
+            self.server_socket = None
+            if dual_stack:  # IPv6 switched off on this computer: plain IPv4
+                self.bind_host = "0.0.0.0" if self.bind_host == "::" else self.bind_host
+                return self._start_ipv4_only()
+            raise
+        return self._after_bind()
+
+    def _start_ipv4_only(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind((self.bind_host, self.port))
+        except OSError:
+            self.server_socket.close()
+            self.server_socket = None
+            raise
+        return self._after_bind()
+
+    def _after_bind(self):
         self.server_socket.listen(32)
         self.server_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self.server_thread.start()
+        if self.transport is not None:
+            self.transport.start()
         return self
 
     def _accept_loop(self):
-        while True:
+        server_socket = self.server_socket  # close() sets the attribute to None
+        while server_socket is not None:
             try:
-                conn, addr = self.server_socket.accept()
+                conn, addr = server_socket.accept()
             except OSError:
                 break
             thread = threading.Thread(target=self._handle_connection, args=(conn, addr), daemon=True)
@@ -213,31 +281,72 @@ class mda:
         return header + body
 
     def _handle_connection(self, conn, addr):
+        addr = (self._plain_ip(addr[0]), addr[1])
         try:
             data = self._recv_packet(conn)
             if not data:
-                conn.close()
                 return
             packet = mdaconnection.decode_packet(data)
-            if packet is None:
-                conn.close()
+            if not isinstance(packet, dict):
                 return
-            packet.setdefault("received_from", f"{addr[0]}:{addr[1]}")
-            print(f"[{self.nodeid}] received: {packet}", flush=True)
-            if packet.get("type") == "ping":
-                reply = {"type": "pong", "nodeid": self.nodeid}
+            if packet.get("type") == "relay_register" and self.transport is not None:
+                conn.settimeout(None)
+                self.transport.handle_relay_register(conn, packet, addr)  # long-lived connection
+                return
+            reply = self._process_packet(packet, addr)
+            if reply is not None:
                 conn.sendall(mdaconnection.encode_packet(reply))
-                return
-            if packet.get("routing") == "onion" and packet.get("type") in (self.MESSAGE_REAL, self.MESSAGE_FAKE):
-                result = self._handle_onion_packet(packet)
-                conn.sendall(mdaconnection.encode_packet(result))
-                return
-            self.received_messages.append(packet)
-            if callable(self.on_message):
-                self.on_message(packet)
-            conn.sendall(mdaconnection.encode_packet({"status": "ok", "nodeid": self.nodeid}))
+        except (OSError, ValueError):
+            pass
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _plain_ip(ip):
+        ip = str(ip)
+        return ip[7:] if ip.startswith("::ffff:") else ip
+
+    def _process_packet(self, packet, addr):
+        """Handle one incoming packet (from TCP, a relay, or UDP) and return the reply."""
+        target = packet.pop("_to", "")
+        if target and target != self.nodeid:
+            return {"status": "wrong_node", "nodeid": self.nodeid}
+        packet.setdefault("received_from", f"{addr[0]}:{addr[1]}")
+        ptype = packet.get("type")
+        if ptype == "ping":
+            return {"type": "pong", "nodeid": self.nodeid, "seen_ip": addr[0]}
+        if ptype == "reach_probe":
+            return self._answer_reach_probe(packet, addr)
+        if ptype == "hello":
+            if self.transport is not None and isinstance(packet.get("record"), dict):
+                self.transport.learn_record(packet["record"])
+            networks = []
+            if callable(self.hello_provider):
+                try:
+                    networks = list(self.hello_provider() or [])
+                except Exception:
+                    networks = []
+            reply = {"type": "hello_reply", "nodeid": self.nodeid, "seen_ip": addr[0], "networks": networks}
+            if self.transport is not None:
+                reply["record"] = self.transport.local_record
+            return reply
+        if self.transport is not None:
+            if ptype == "relay_forward":
+                return self.transport.handle_relay_forward(packet)
+            if ptype == "punch_request":
+                return self.transport.handle_punch_request(packet)
+            if ptype == "routes_record":
+                return {"status": "ok" if self.transport.learn_record(packet.get("record")) else "ignored"}
+        if packet.get("routing") == "onion" and ptype in (self.MESSAGE_REAL, self.MESSAGE_FAKE):
+            return self._handle_onion_packet(packet)
+        print(f"[{self.nodeid}] received: {ptype} {packet.get('action', '')}", flush=True)
+        self.received_messages.append(packet)
+        if callable(self.on_message):
+            self.on_message(packet)
+        return {"status": "ok", "nodeid": self.nodeid}
 
     @staticmethod
     def _load_or_create_keys(private_key_pem, public_key_pem):
@@ -399,7 +508,88 @@ class mda:
         ack = self.send_message(host, port, payload, timeout=timeout)
         return ack
 
+    def _answer_reach_probe(self, packet, addr):
+        """Connect back to the asking node (at the IP we saw it from) to test the reverse path."""
+        result = {"type": "reach_result", "nodeid": self.nodeid, "seen_ip": addr[0], "callback_ok": False, "callback_error": ""}
+        callback_node = str(packet.get("callback_node", ""))
+        if callback_node and self.transport is not None and mda_p2p.is_virtual(callback_node):
+            # Reverse test through normal routing (direct, hole punch or relay).
+            if isinstance(packet.get("record"), dict):
+                self.transport.learn_record(packet["record"])
+            try:
+                reply = self.send_message(*self.normalize_peer(callback_node), {"type": "ping", "nodeid": self.nodeid}, timeout=8)
+                result["callback_ok"] = isinstance(reply, dict) and reply.get("type") == "pong"
+                result["callback_route"] = self.route_description(callback_node)
+            except (OSError, ValueError) as exc:
+                result["callback_error"] = str(exc) or exc.__class__.__name__
+            return result
+        try:
+            callback_port = int(packet.get("callback_port", 0))
+        except (TypeError, ValueError):
+            callback_port = 0
+        if not 0 < callback_port < 65536:
+            result["callback_error"] = "missing callback port"
+            return result
+        try:
+            reply = self.ping_peer(addr[0], callback_port, timeout=4)
+            result["callback_ok"] = isinstance(reply, dict) and reply.get("type") == "pong"
+            if not result["callback_ok"]:
+                result["callback_error"] = "no reply"
+        except (OSError, ValueError) as exc:
+            result["callback_error"] = str(exc) or exc.__class__.__name__
+        return result
+
+    def probe_reachability(self, endpoint, timeout=8):
+        """Test both directions with one peer.
+
+        Returns {"connect_ok", "callback_ok", "seen_ip", "error"}:
+        connect_ok  - we could open a connection to the peer
+        callback_ok - the peer could open a connection back to us
+        seen_ip     - the address the peer saw us coming from
+        """
+        result = {"connect_ok": False, "callback_ok": False, "seen_ip": "", "error": ""}
+        try:
+            host, port = self.normalize_peer(endpoint)
+            probe = {"type": "reach_probe", "callback_port": self.port, "nodeid": self.nodeid}
+            if self.transport is not None:
+                probe["callback_node"] = self.nodeid
+                probe["record"] = self.transport.local_record
+            reply = self.send_message(host, port, probe, timeout=timeout)
+        except (OSError, ValueError) as exc:
+            result["error"] = str(exc) or exc.__class__.__name__
+            return result
+        result["connect_ok"] = True
+        result["route"] = self.route_description(mda_p2p.format_endpoint(host, port))
+        if isinstance(reply, dict):
+            result["seen_ip"] = str(reply.get("seen_ip", ""))
+            if reply.get("type") == "reach_result":
+                result["callback_ok"] = bool(reply.get("callback_ok"))
+                result["error"] = str(reply.get("callback_error", ""))
+                result["callback_route"] = str(reply.get("callback_route", ""))
+            else:
+                result["error"] = "peer runs an older version (cannot test the reverse direction)"
+        return result
+
+    def hello(self, endpoint, timeout=5):
+        """Ask a node which networks it offers. Returns the hello_reply dict or None."""
+        host, port = self.normalize_peer(endpoint)
+        request = {"type": "hello", "nodeid": self.nodeid}
+        if self.transport is not None:
+            request["record"] = self.transport.local_record
+        reply = self.send_message(host, port, request, timeout=timeout)
+        if not (isinstance(reply, dict) and reply.get("type") == "hello_reply"):
+            return None
+        if self.transport is not None and isinstance(reply.get("record"), dict):
+            self.transport.learn_record(reply["record"])
+        return reply
+
     def send_message(self, host, port, payload, timeout=5):
+        """Send to a node and return its reply, using whichever route works (see mda_p2p)."""
+        if self.transport is not None:
+            return self.transport.send(mda_p2p.format_endpoint(host, port), payload, timeout)
+        return self._send_tcp(host, port, payload, timeout)
+
+    def _send_tcp(self, host, port, payload, timeout=5):
         with socket.create_connection((host, port), timeout=timeout) as conn:
             conn.sendall(mdaconnection.encode_packet(payload))
             raw = self._recv_packet(conn)
@@ -407,8 +597,13 @@ class mda:
                 return None
             return mdaconnection.decode_packet(raw)
 
+    def route_description(self, endpoint):
+        if self.transport is None:
+            return "direct"
+        return self.transport.last_route.get(endpoint, "")
+
     def _local_endpoint(self):
-        return f"{self.host}:{self.port}"
+        return self.nodeid
 
     def _normalize_endpoint_list(self, values):
         endpoints = []
@@ -598,7 +793,14 @@ class mda:
                     continue
 
     def close(self):
+        if self.transport is not None:
+            self.transport.close()
         if self.server_socket is not None:
+            try:
+                # Wake the thread blocked in accept(); close() alone does not on Linux.
+                self.server_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self.server_socket.close()
             except OSError:
